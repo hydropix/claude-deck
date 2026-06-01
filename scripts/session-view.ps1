@@ -24,6 +24,9 @@ public class WinFocus {
   [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool f);
   [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
   [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+  [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+  [StructLayout(LayoutKind.Sequential)] struct POINT { public int X; public int Y; }
   const int SW_RESTORE = 9;
   public static bool FocusByTitle(string needle) {
     IntPtr found = IntPtr.Zero;
@@ -65,6 +68,13 @@ public class WinFocus {
     SetForegroundWindow(found);
     AttachThreadInput(cur, fg, false);
     return true;
+  }
+  public static bool AnyMouseDown() {
+    return ((GetAsyncKeyState(0x01) & 0x8000) != 0) || ((GetAsyncKeyState(0x02) & 0x8000) != 0);
+  }
+  public static bool CursorOutside(int l, int t, int r, int b) {
+    POINT p; if (!GetCursorPos(out p)) return false;
+    return (p.X < l || p.X > r || p.Y < t || p.Y > b);
   }
 }
 
@@ -444,6 +454,7 @@ function Refresh-List {
     $script:lastAnimKey = $triggerKey
     $script:flashBtn    = $triggerBtn
     $script:flashStart  = [Environment]::TickCount
+    $script:shownAt     = [Environment]::TickCount   # re-arm the click-outside grace on a fresh pop
   }
   if ((@($script:waitBtns).Count -gt 0) -or $script:flashBtn) { $animTimer.Start() }
 }
@@ -460,7 +471,26 @@ $followTimer.Add_Tick({ try { [VDesk]::FollowToCurrentDesktop($form.Handle) } ca
 $followTimer.Start()
 
 $form.Add_KeyDown({ if ($_.KeyCode -eq 'Escape') { $form.Close() } })
-$form.Add_Shown({ Refresh-List })
-$form.Add_FormClosed({ $timer.Stop(); $followTimer.Stop() })
+
+# Close on a click OUTSIDE the window (left or right button), but only after a
+# 0.5s grace since it (re)appeared. The window intentionally doesn't steal
+# focus, so we poll the global mouse state rather than rely on Deactivate.
+$script:shownAt  = [Environment]::TickCount
+$script:prevDown = $false
+$form.Add_Shown({ $script:shownAt = [Environment]::TickCount; Refresh-List })
+
+$clickTimer = New-Object System.Windows.Forms.Timer
+$clickTimer.Interval = 50
+$clickTimer.Add_Tick({
+  $down = [WinFocus]::AnyMouseDown()
+  if ($down -and -not $script:prevDown -and (([Environment]::TickCount - $script:shownAt) -ge 500)) {
+    $b = $form.Bounds
+    if ([WinFocus]::CursorOutside($b.Left, $b.Top, $b.Right, $b.Bottom)) { $form.Close() }
+  }
+  $script:prevDown = $down
+})
+$clickTimer.Start()
+
+$form.Add_FormClosed({ $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop() })
 
 [void]$form.ShowDialog()

@@ -9,7 +9,7 @@ No Node, no Python, no dependencies — just PowerShell and a couple of Claude C
 ## Features
 
 - **System-tray icon** — click it for a compact list of your sessions.
-- **Large centered overview** — a big, readable panel (great on 4K). Opens automatically every time Claude finishes a task, or on demand.
+- **Large centered overview** — a big, readable panel (great on 4K). Opens automatically every time Claude finishes a task, or on demand. Dismiss it with `Esc`, the `✕`, or a click anywhere outside it (with a 0.5s grace after it appears, to avoid accidental closes).
 - **Three live states** — 🟢 working, 🟠 **waiting for you** (permission / question), ⚪ finished — with the last prompt and elapsed time. Sessions that need you are sorted to the top and **breathe orange** so you never miss a blocked session.
 - **"Who just finished?" highlight** — when the overview pops up, the row of the session that just completed pulses green for a moment, so you instantly see which one called you.
 - **Per-project badge** — each project gets a stable colour + its initials in a square badge at the start of the row (and a swatch in the tray menu), so different repos are instantly distinguishable.

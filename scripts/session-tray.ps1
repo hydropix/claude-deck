@@ -63,8 +63,9 @@ public class WinFocus {
 }
 "@
 
-$stateDir = Join-Path $env:USERPROFILE '.claude\sessions\state'
-$dndFlag  = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'
+$stateDir  = Join-Path $env:USERPROFILE '.claude\sessions\state'
+$dndFlag   = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'
+$closeFlag = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'
 
 # Per-project accent colour (hash of name -> hue) + a small colour swatch icon.
 function Hue2Rgb($p, $q, $t) {
@@ -170,6 +171,15 @@ function Build-Menu {
     else { Set-Content -LiteralPath $dndFlag -Value '' -Encoding ASCII }
   })
   [void]$menu.Items.Add($dnd)
+
+  $co = New-Object System.Windows.Forms.ToolStripMenuItem('Fermer au clic exterieur')
+  $co.Checked = (Test-Path $closeFlag)
+  $co.ToolTipText = "Fermer la grande vue quand on clique en dehors (desactive par defaut)"
+  $co.Add_Click({
+    if (Test-Path $closeFlag) { Remove-Item $closeFlag -Force -ErrorAction SilentlyContinue }
+    else { Set-Content -LiteralPath $closeFlag -Value '' -Encoding ASCII }
+  })
+  [void]$menu.Items.Add($co)
 
   $big = $menu.Items.Add('Afficher en grand')
   $big.Add_Click({

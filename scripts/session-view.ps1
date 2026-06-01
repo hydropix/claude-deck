@@ -127,7 +127,8 @@ $dupes = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorA
   Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*session-view.ps1*' })
 if ($dupes.Count -gt 0) { exit 0 }
 
-$stateDir = Join-Path $env:USERPROFILE '.claude\sessions\state'
+$stateDir  = Join-Path $env:USERPROFILE '.claude\sessions\state'
+$closeFlag = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'   # opt-in: close on outside click
 
 # --- Sizing relative to the primary screen (looks right at any resolution) ---
 $screen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
@@ -509,7 +510,7 @@ $clickTimer = New-Object System.Windows.Forms.Timer
 $clickTimer.Interval = 50
 $clickTimer.Add_Tick({
   $down = [WinFocus]::AnyMouseDown()
-  if ($down -and -not $script:prevDown -and (([Environment]::TickCount - $script:shownAt) -ge 500)) {
+  if ($down -and -not $script:prevDown -and (([Environment]::TickCount - $script:shownAt) -ge 500) -and (Test-Path $closeFlag)) {
     $b = $form.Bounds
     if ([WinFocus]::CursorOutside($b.Left, $b.Top, $b.Right, $b.Bottom)) { $form.Close() }
   }

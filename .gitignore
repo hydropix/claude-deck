@@ -1,0 +1,13 @@
+# Runtime state (written at the deployed location, not in the repo — guard anyway)
+state/
+scripts/state/
+
+# Temp / scratch
+_*.ps1
+*.log
+*.bak
+*.tmp
+
+# OS
+Thumbs.db
+desktop.ini

@@ -1,0 +1,106 @@
+# ClaudeDeck installer (Windows).
+# Copies the scripts, merges the required Claude Code hooks into settings.json
+# (idempotent, non-destructive), creates shortcuts, and starts the tray.
+$ErrorActionPreference = 'Stop'
+
+$ScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$src      = Join-Path $ScriptRoot 'scripts'
+$dest     = Join-Path $env:USERPROFILE '.claude\sessions'
+$settings = Join-Path $env:USERPROFILE '.claude\settings.json'
+
+Write-Host 'ClaudeDeck - installation...' -ForegroundColor Cyan
+
+# --- 1) Copy scripts -------------------------------------------------------
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+Get-ChildItem $src -File | ForEach-Object { Copy-Item $_.FullName (Join-Path $dest $_.Name) -Force }
+Write-Host "  Scripts -> $dest"
+
+# --- 2) Merge hooks into settings.json -------------------------------------
+function ConvertTo-HashtableDeep($o) {
+  if ($null -eq $o) { return $null }
+  if ($o -is [string]) { return $o }
+  if ($o -is [System.Management.Automation.PSCustomObject]) {
+    $h = [ordered]@{}
+    foreach ($p in $o.PSObject.Properties) { $h[$p.Name] = ConvertTo-HashtableDeep $p.Value }
+    return $h
+  }
+  if ($o -is [System.Collections.IEnumerable]) {
+    return @($o | ForEach-Object { ConvertTo-HashtableDeep $_ })
+  }
+  return $o
+}
+
+function Add-Hook($hooks, $evt, $command, $marker) {
+  if (-not $hooks.Contains($evt) -or $null -eq $hooks[$evt]) { $hooks[$evt] = @() }
+  $arr = @($hooks[$evt])
+  foreach ($grp in $arr) {
+    if ($grp -and $grp.Contains('hooks')) {
+      foreach ($hk in @($grp['hooks'])) {
+        if ($hk -and $hk['command'] -and ($hk['command'] -like "*$marker*")) { return }  # already installed
+      }
+    }
+  }
+  $arr += [ordered]@{ hooks = @([ordered]@{ type = 'command'; shell = 'powershell'; command = $command }) }
+  $hooks[$evt] = $arr
+}
+
+if (Test-Path $settings) {
+  Copy-Item $settings "$settings.bak" -Force
+  $raw = [System.IO.File]::ReadAllText($settings)   # UTF-8 (Get-Content -Raw would mangle accents on PS 5.1)
+  $obj = if ($raw.Trim()) { $raw | ConvertFrom-Json } else { [pscustomobject]@{} }
+} else {
+  $obj = [pscustomobject]@{}
+}
+$cfg = ConvertTo-HashtableDeep $obj
+if ($cfg -isnot [System.Collections.IDictionary]) { $cfg = [ordered]@{} }
+if (-not $cfg.Contains('hooks') -or $cfg['hooks'] -isnot [System.Collections.IDictionary]) { $cfg['hooks'] = [ordered]@{} }
+$hooks = $cfg['hooks']
+
+$trackerPrompt = '& "$env:USERPROFILE\.claude\sessions\session-tracker.ps1" -Event prompt'
+$trackerStop   = '& "$env:USERPROFILE\.claude\sessions\session-tracker.ps1" -Event stop'
+$trackerEnd    = '& "$env:USERPROFILE\.claude\sessions\session-tracker.ps1" -Event end'
+$viewStop = (@'
+Start-Process wscript.exe -ArgumentList ('"' + (Join-Path $env:USERPROFILE '.claude\sessions\show-view.vbs') + '"')
+'@).Trim()
+
+Add-Hook $hooks 'UserPromptSubmit' $trackerPrompt '-Event prompt'
+Add-Hook $hooks 'Stop'             $trackerStop   '-Event stop'
+Add-Hook $hooks 'Stop'             $viewStop      'show-view.vbs'
+Add-Hook $hooks 'SessionEnd'       $trackerEnd    '-Event end'
+
+$cfg['hooks'] = $hooks
+$json = $cfg | ConvertTo-Json -Depth 30
+[System.IO.File]::WriteAllText($settings, $json, (New-Object System.Text.UTF8Encoding($false)))
+Write-Host "  Hooks merged into $settings (backup: settings.json.bak)"
+
+# --- 3) Shortcuts ----------------------------------------------------------
+$ws = New-Object -ComObject WScript.Shell
+
+$startup = [Environment]::GetFolderPath('Startup')
+$lnk = $ws.CreateShortcut((Join-Path $startup 'ClaudeDeck Tray.lnk'))
+$lnk.TargetPath       = 'wscript.exe'
+$lnk.Arguments        = '"' + (Join-Path $dest 'start-tray.vbs') + '"'
+$lnk.WorkingDirectory = $dest
+$lnk.Description       = 'ClaudeDeck tray'
+$lnk.Save()
+
+$desktop = [Environment]::GetFolderPath('Desktop')
+$lnk2 = $ws.CreateShortcut((Join-Path $desktop 'ClaudeDeck (grand).lnk'))
+$lnk2.TargetPath       = 'wscript.exe'
+$lnk2.Arguments        = '"' + (Join-Path $dest 'show-view.vbs') + '"'
+$lnk2.WorkingDirectory = $dest
+$lnk2.IconLocation     = 'imageres.dll,109'
+$lnk2.Description       = 'ClaudeDeck - large view'
+$lnk2.Save()
+Write-Host '  Startup + desktop shortcuts created'
+
+# --- 4) (Re)start the tray -------------------------------------------------
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+  Where-Object { $_.CommandLine -like '*session-tray.ps1*' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Seconds 1
+Start-Process wscript.exe -ArgumentList ('"' + (Join-Path $dest 'start-tray.vbs') + '"')
+
+Write-Host ''
+Write-Host 'Done. The tray icon is running (look under the ^ hidden-icons area on Windows 11).' -ForegroundColor Green
+Write-Host 'Open a new Claude Code session (or send a prompt) to populate the deck.' -ForegroundColor Green

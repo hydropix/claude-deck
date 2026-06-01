@@ -49,6 +49,7 @@ switch ($Event) {
       $o = [System.IO.File]::ReadAllText($file) | ConvertFrom-Json
       $o.status  = 'done'
       $o.updated = (Get-Date).ToString('o')
+      if ($o.PSObject.Properties.Name -contains 'seen') { $o.seen = $false }   # new completion = unseen
       Save $o
     } else {
       $cwd = [string]$data.cwd

@@ -12,7 +12,8 @@ No Node, no Python, no dependencies — just PowerShell and a couple of Claude C
 - **Large centered overview** — a big, readable panel (great on 4K). Opens automatically every time Claude finishes a task, or on demand.
 - **Three live states** — 🟢 working, 🟠 **waiting for you** (permission / question), ⚪ finished — with the last prompt and elapsed time. Sessions that need you are sorted to the top and **breathe orange** so you never miss a blocked session.
 - **"Who just finished?" highlight** — when the overview pops up, the row of the session that just completed pulses green for a moment, so you instantly see which one called you.
-- **Per-project colours** — each project gets a stable accent colour (row border in the overview, swatch in the tray menu) so different repos are instantly distinguishable.
+- **Per-project badge** — each project gets a stable colour + its initials in a square badge at the start of the row (and a swatch in the tray menu), so different repos are instantly distinguishable.
+- **Unopened-completion border** — a finished session you haven't opened yet gets a subtle blue outline; it clears the moment you click the row. Easy to see what's done but still unreviewed.
 - **Do Not Disturb** — toggle in the tray menu: suspends the auto-popup and reminders while you're deep-focused on one project.
 - **Forgotten-task reminder** — a gentle nudge if a finished task sits unattended for a while (off during DND).
 - **Click to focus** — clicking a session brings its VS Code / Cursor window to the front **without resizing or moving it**.

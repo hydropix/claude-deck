@@ -129,6 +129,7 @@ $green  = [System.Drawing.Color]::FromArgb(80, 220, 130)
 $orange = [System.Drawing.Color]::FromArgb(245, 175, 70)   # "waiting for you"
 $grey   = [System.Drawing.Color]::FromArgb(150, 150, 158)
 $white  = [System.Drawing.Color]::FromArgb(235, 235, 240)
+$unseen = [System.Drawing.Color]::FromArgb(150, 175, 220)   # border: finished & not yet opened
 
 # Stable per-project accent colour (hash of the name -> hue).
 function Hue2Rgb($p, $q, $t) {
@@ -147,6 +148,52 @@ function Get-ProjectColor($name) {
   $p = 2 * $l - $q
   $r = Hue2Rgb $p $q ($h + 1.0/3); $g = Hue2Rgb $p $q $h; $b = Hue2Rgb $p $q ($h - 1.0/3)
   return [System.Drawing.Color]::FromArgb([int]($r * 255), [int]($g * 255), [int]($b * 255))
+}
+function Get-Initials($name) {
+  if (-not $name) { return '?' }
+  $caps = ($name -creplace '[^A-Z0-9]', '')
+  if ($caps.Length -ge 2) { return $caps.Substring(0, 2) }
+  return ($name.Substring(0, [math]::Min(2, $name.Length))).ToUpper()
+}
+function Get-TextOn($color) {
+  $lum = (0.299 * $color.R + 0.587 * $color.G + 0.114 * $color.B) / 255.0
+  if ($lum -gt 0.58) { return [System.Drawing.Color]::FromArgb(25, 25, 30) } else { return [System.Drawing.Color]::White }
+}
+# A rounded colour swatch with the project initials.
+function New-Badge($name, $size) {
+  $color = Get-ProjectColor $name
+  $bmp = New-Object System.Drawing.Bitmap($size, $size)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.SmoothingMode    = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+  $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+  $g.Clear([System.Drawing.Color]::Transparent)
+  $d = [int]($size * 0.42)
+  $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+  $path.AddArc(0, 0, $d, $d, 180, 90)
+  $path.AddArc($size - $d - 1, 0, $d, $d, 270, 90)
+  $path.AddArc($size - $d - 1, $size - $d - 1, $d, $d, 0, 90)
+  $path.AddArc(0, $size - $d - 1, $d, $d, 90, 90)
+  $path.CloseFigure()
+  $brush = New-Object System.Drawing.SolidBrush($color)
+  $g.FillPath($brush, $path)
+  $font = New-Object System.Drawing.Font('Segoe UI', [single]($size * 0.40), [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
+  $tb = New-Object System.Drawing.SolidBrush((Get-TextOn $color))
+  $sf = New-Object System.Drawing.StringFormat
+  $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
+  $g.DrawString((Get-Initials $name), $font, $tb, (New-Object System.Drawing.RectangleF(0, 0, $size, $size)), $sf)
+  $g.Dispose(); $brush.Dispose(); $tb.Dispose(); $font.Dispose(); $path.Dispose()
+  return $bmp
+}
+# Mark a session as "seen" (clears the unseen border) by writing into its state file.
+function Set-Seen($sid) {
+  try {
+    $f = Join-Path $stateDir ($sid + '.json')
+    if (Test-Path $f) {
+      $o = [System.IO.File]::ReadAllText($f) | ConvertFrom-Json
+      if ($o.PSObject.Properties.Name -contains 'seen') { $o.seen = $true } else { $o | Add-Member -NotePropertyName seen -NotePropertyValue $true }
+      [System.IO.File]::WriteAllText($f, ($o | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    }
+  } catch {}
 }
 
 $form = New-Object System.Windows.Forms.Form
@@ -221,14 +268,20 @@ $list.BringToFront()
 
 $rowH = [int]($rowPt * 3.4)
 $rowMargin = 10
+$badgeSize = [int]($rowPt * 2.0)
 
-function Make-Row($s, $status, $promptText, $age) {
+function Make-Row($s, $status, $seen, $promptText, $age) {
   $btn = New-Object System.Windows.Forms.Button
   $btn.FlatStyle = 'Flat'
-  $btn.FlatAppearance.BorderSize  = 2
-  $btn.FlatAppearance.BorderColor = (Get-ProjectColor ([string]$s.project))   # per-project accent
   $btn.FlatAppearance.MouseOverBackColor = $hover
   $btn.BackColor = $rowBg
+  # Border is reserved for "finished but not opened yet" (unseen completion).
+  if ($status -eq 'done' -and -not $seen) {
+    $btn.FlatAppearance.BorderSize  = 2
+    $btn.FlatAppearance.BorderColor = $unseen
+  } else {
+    $btn.FlatAppearance.BorderSize = 0
+  }
   switch ($status) {
     'running' { $fc = $green;  $dot = [char]0x25CF }   # ●
     'waiting' { $fc = $orange; $dot = [char]0x25CF }   # ●
@@ -237,16 +290,22 @@ function Make-Row($s, $status, $promptText, $age) {
   $btn.ForeColor = $fc
   $btn.Font = New-Object System.Drawing.Font('Segoe UI', $rowPt)
   $btn.TextAlign = 'MiddleLeft'
-  $btn.Padding = New-Object System.Windows.Forms.Padding(18, 0, 18, 0)
+  $btn.TextImageRelation = 'ImageBeforeText'
+  $btn.ImageAlign = 'MiddleLeft'
+  $btn.Image = New-Badge ([string]$s.project) $badgeSize   # coloured square + initials
+  $btn.Padding = New-Object System.Windows.Forms.Padding(14, 0, 18, 0)
   $btn.Width  = $list.ClientSize.Width - 40
   $btn.Height = $rowH
   $btn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, $rowMargin)
   $btn.TabStop = $false
   $sep = [char]0x2014
-  $btn.Text = ('{0}   {1}    {2}    {3}    ({4})' -f $dot, $s.project, $sep, $promptText, $age)
+  $btn.Text = ('  {0}  {1}    {2}    {3}    ({4})' -f $dot, $s.project, $sep, $promptText, $age)
+  $btn.Add_Disposed({ param($snd, $e) try { if ($snd.Image) { $snd.Image.Dispose() } } catch {} })
   $proj = [string]$s.project
   $cwd  = [string]$s.cwd
+  $sid  = [string]$s.session_id
   $btn.Add_Click({
+    Set-Seen $sid                                          # mark this completion as opened
     if (-not [WinFocus]::FocusByTitle($proj)) {
       # Fallback: focus/open the REAL VS Code (never Cursor).
       $codeExe = (Get-Process -Name Code -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1).Path
@@ -323,13 +382,15 @@ function Refresh-List {
     $mins = [int]($now - $e.upd).TotalMinutes
     $age = if ($mins -lt 1) { 'maintenant' } elseif ($mins -lt 60) { "${mins}m" } else { "$([int]($mins / 60))h" }
     $order = switch ($status) { 'waiting' { 0 } 'running' { 1 } default { 2 } }
-    $rows += [pscustomobject]@{ s = $s; status = $status; p = $p; age = $age; order = $order; upd = $e.upd }
+    $seen  = [bool]$s.seen
+    $unseenDone = ($status -eq 'done' -and -not $seen)   # finished & not yet opened -> border
+    $rows += [pscustomobject]@{ s = $s; status = $status; p = $p; age = $age; order = $order; upd = $e.upd; seen = $seen; unseenDone = $unseenDone }
   }
   # Sort: waiting first, then running, then done; newest within each group.
   $rows = @($rows | Sort-Object @{ Expression = 'order' }, @{ Expression = 'upd'; Descending = $true })
 
   # Anti-flicker: only rebuild when the displayed content actually changed.
-  $sig = ($rows | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.s.project, $_.status, $_.p, $_.age }) -join "`n"
+  $sig = ($rows | ForEach-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.s.project, $_.status, $_.p, $_.age, $_.unseenDone }) -join "`n"
   if ($sig -eq $script:lastSig) { return }
   $script:lastSig = $sig
 
@@ -357,7 +418,7 @@ function Refresh-List {
     $list.Controls.Add($empty)
   } else {
     foreach ($r in $rows) {
-      $b = Make-Row $r.s $r.status $r.p $r.age
+      $b = Make-Row $r.s $r.status $r.seen $r.p $r.age
       $list.Controls.Add($b)
       if ($r.status -eq 'waiting') { $waiting += $b }
       if ($triggerSid -and ([string]$r.s.session_id -eq $triggerSid)) { $triggerBtn = $b }

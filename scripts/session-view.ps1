@@ -284,6 +284,9 @@ $rowH = [int]($rowPt * 3.4)
 $rowMargin = 10
 $badgeSize = [int]($rowPt * 2.0)
 
+# Spinner frames for "running" (a rotating half-disc) — animated by $spinTimer.
+$script:spinFrames = @([char]0x25D0, [char]0x25D3, [char]0x25D1, [char]0x25D2)   # ◐ ◓ ◑ ◒
+
 function Make-Row($s, $status, $seen, $promptText, $age) {
   $btn = New-Object System.Windows.Forms.Button
   $btn.FlatStyle = 'Flat'
@@ -297,9 +300,9 @@ function Make-Row($s, $status, $seen, $promptText, $age) {
     $btn.FlatAppearance.BorderSize = 0
   }
   switch ($status) {
-    'running' { $fc = $green;  $dot = [char]0x25CF }   # ●
-    'waiting' { $fc = $orange; $dot = [char]0x25CF }   # ●
-    default   { $fc = $grey;   $dot = [char]0x25CB }   # ○
+    'running' { $fc = $green;  $glyph = $script:spinFrames[0] }   # rotating disc (animated)
+    'waiting' { $fc = $orange; $glyph = [char]0x25CF }            # ●
+    default   { $fc = $grey;   $glyph = [char]0x25CB }            # ○
   }
   $btn.ForeColor = $fc
   $btn.Font = New-Object System.Drawing.Font('Segoe UI', $rowPt)
@@ -313,7 +316,9 @@ function Make-Row($s, $status, $seen, $promptText, $age) {
   $btn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, $rowMargin)
   $btn.TabStop = $false
   $sep = [char]0x2014
-  $btn.Text = ('  {0}  {1}    {2}    {3}    ({4})' -f $dot, $s.project, $sep, $promptText, $age)
+  $rest = ('  {0}    {1}    {2}    ({3})' -f $s.project, $sep, $promptText, $age)
+  $btn.Text = '  ' + $glyph + $rest
+  if ($status -eq 'running') { $btn.Tag = $rest }   # spinner timer rewrites: '  ' + frame + Tag
   $btn.Add_Disposed({ param($snd, $e) try { if ($snd.Image) { $snd.Image.Dispose() } } catch {} })
   $proj = [string]$s.project
   $cwd  = [string]$s.cwd
@@ -369,6 +374,18 @@ $animTimer.Add_Tick({
   if ((@($script:waitBtns).Count -eq 0) -and (-not $script:flashBtn)) { $animTimer.Stop() }
 })
 
+# Spinner: rotate the glyph on every running row (so it visibly "turns").
+$script:spinBtns = @()
+$spinTimer = New-Object System.Windows.Forms.Timer
+$spinTimer.Interval = 110
+$spinTimer.Add_Tick({
+  if (@($script:spinBtns).Count -eq 0) { $spinTimer.Stop(); return }
+  $f = $script:spinFrames[ [int]([Environment]::TickCount / 110) % $script:spinFrames.Count ]
+  foreach ($b in @($script:spinBtns)) {
+    try { $b.Text = '  ' + $f + [string]$b.Tag } catch {}
+  }
+})
+
 $script:lastSig = $null
 
 function Refresh-List {
@@ -415,14 +432,16 @@ function Refresh-List {
   }
 
   # Buttons are about to be recreated; reset animation targets.
-  $animTimer.Stop()
+  $animTimer.Stop(); $spinTimer.Stop()
   $script:waitBtns = @()
+  $script:spinBtns = @()
   $script:flashBtn = $null
 
   $list.SuspendLayout()
   $list.Controls.Clear()
   $triggerBtn = $null
   $waiting = @()
+  $spinning = @()
   if ($rows.Count -eq 0) {
     $empty = New-Object System.Windows.Forms.Label
     $empty.Text = 'Aucune session active'
@@ -435,6 +454,7 @@ function Refresh-List {
       $b = Make-Row $r.s $r.status $r.seen $r.p $r.age
       $list.Controls.Add($b)
       if ($r.status -eq 'waiting') { $waiting += $b }
+      if ($r.status -eq 'running') { $spinning += $b }
       if ($triggerSid -and ([string]$r.s.session_id -eq $triggerSid)) { $triggerBtn = $b }
     }
   }
@@ -452,8 +472,9 @@ function Refresh-List {
     $form.Top    = [int]($screen.Y + ($screen.Height - $newH) / 2)
   }
 
-  # Drive animations: waiting rows breathe; a NEW completion flashes once.
+  # Drive animations: running rows spin; waiting rows breathe; a NEW completion flashes once.
   $script:waitBtns = $waiting
+  $script:spinBtns = $spinning
   if ($triggerKey -and ($triggerKey -ne $script:lastAnimKey)) {
     $script:lastAnimKey = $triggerKey
     $script:flashBtn    = $triggerBtn
@@ -461,6 +482,7 @@ function Refresh-List {
     $script:shownAt     = [Environment]::TickCount   # re-arm the click-outside grace on a fresh pop
   }
   if ((@($script:waitBtns).Count -gt 0) -or $script:flashBtn) { $animTimer.Start() }
+  if (@($script:spinBtns).Count -gt 0) { $spinTimer.Start() }
 }
 
 $timer = New-Object System.Windows.Forms.Timer
@@ -495,6 +517,6 @@ $clickTimer.Add_Tick({
 })
 $clickTimer.Start()
 
-$form.Add_FormClosed({ $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop() })
+$form.Add_FormClosed({ $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop(); $spinTimer.Stop() })
 
 [void]$form.ShowDialog()

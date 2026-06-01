@@ -14,6 +14,7 @@ No Node, no Python, no dependencies — just PowerShell and a couple of Claude C
 - **"Who just finished?" highlight** — when the overview pops up, the row of the session that just completed pulses green for a moment, so you instantly see which one called you.
 - **Per-project badge** — each project gets a stable colour + its initials in a square badge at the start of the row (and a swatch in the tray menu), so different repos are instantly distinguishable.
 - **Unopened-completion border** — a finished session you haven't opened yet gets a subtle blue outline; it clears the moment you click the row. Easy to see what's done but still unreviewed.
+- **Global hotkey** — `Win+Alt+C` opens/focuses the overview from anywhere (configurable; falls back automatically if the combo is taken).
 - **Do Not Disturb** — toggle in the tray menu: suspends the auto-popup and reminders while you're deep-focused on one project.
 - **Forgotten-task reminder** — a gentle nudge if a finished task sits unattended for a while (off during DND).
 - **Click to focus** — clicking a session brings its VS Code / Cursor window to the front **without resizing or moving it**.
@@ -52,7 +53,7 @@ The installer will:
 ## Usage
 
 - **Tray icon** → click for the compact session list. Click a row to focus that session's editor window.
-- **Large view** → opens automatically when a task finishes, or via the **ClaudeDeck (grand)** desktop shortcut, or the tray menu **Afficher en grand**. Close it with the **✕** or **Esc**.
+- **Large view** → opens automatically when a task finishes, or via the **ClaudeDeck (grand)** desktop shortcut, the tray menu **Afficher en grand**, or the global hotkey **`Win+Alt+C`**. Close it with the **✕** or **Esc**.
 
 ## How it works
 

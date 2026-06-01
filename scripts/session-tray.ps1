@@ -223,4 +223,51 @@ $notify.Add_MouseClick({
   }
 })
 
+# --- Global hotkey: open/focus the large view from anywhere ---------------
+# Default Win+Alt+C (the Win key alone is mostly reserved by Windows; Win+Alt+
+# <key> is registrable). Edit $HotMods / $HotVk below to change.
+#   modifiers: ALT=1, CTRL=2, SHIFT=4, WIN=8 (combine with -bor); NOREPEAT=0x4000
+#   key (VK):  'C'=0x43  'S'=0x53  'D'=0x44  'J'=0x4A  F8=0x77  F9=0x78
+$HotMods = (1 -bor 8 -bor 0x4000)   # Win + Alt (+ no-repeat)
+$HotVk   = 0x43                     # C
+$HotLabel = 'Win+Alt+C'
+
+Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+public class HotKeyWindow : NativeWindow {
+  [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hWnd, int id, uint m, uint vk);
+  [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+  const int WM_HOTKEY = 0x0312;
+  public event Action Pressed;
+  int _id = 0;
+  public HotKeyWindow() { CreateHandle(new CreateParams()); }
+  public bool Register(uint mods, uint vk) { return RegisterHotKey(this.Handle, ++_id, mods, vk); }
+  protected override void WndProc(ref Message m) {
+    if (m.Msg == WM_HOTKEY && Pressed != null) Pressed();
+    base.WndProc(ref m);
+  }
+}
+"@
+
+$hk = New-Object HotKeyWindow
+$hk.add_Pressed({
+  $vbs = Join-Path $env:USERPROFILE '.claude\sessions\show-view.vbs'
+  Start-Process wscript.exe -ArgumentList ('"{0}"' -f $vbs) -ErrorAction SilentlyContinue
+})
+# Try the chosen combo; fall back to a couple of alternatives if it's taken.
+$registered = $null
+foreach ($try in @(
+    @{ m = $HotMods;                  v = $HotVk; lbl = $HotLabel },
+    @{ m = (1 -bor 8 -bor 0x4000);    v = 0x4A;   lbl = 'Win+Alt+J' },
+    @{ m = (2 -bor 1 -bor 0x4000);    v = 0x43;   lbl = 'Ctrl+Alt+C' })) {
+  if ($hk.Register([uint32]$try.m, [uint32]$try.v)) { $registered = $try.lbl; break }
+}
+try {
+  if ($registered) {
+    $notify.ShowBalloonTip(4000, 'Claude Sessions', "Raccourci global : $registered (ouvre la grande vue)", [System.Windows.Forms.ToolTipIcon]::Info)
+  }
+} catch {}
+
 [System.Windows.Forms.Application]::Run()

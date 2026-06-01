@@ -3,9 +3,11 @@
 #   ● green = Claude is working   ○ grey = finished
 # Click a session -> focus its VS Code / Cursor window (by title, no new window).
 
-# Single-instance guard: a named mutex prevents duplicate tray icons.
-$script:mutex = New-Object System.Threading.Mutex($false, 'Global\ClaudeSessionsTray')
-if (-not $script:mutex.WaitOne(0)) { exit 0 }
+# Single-instance guard: if another tray process is already running, exit.
+# (A named mutex proved unreliable here, so we scan for a sibling process.)
+$dupes = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*session-tray.ps1*' })
+if ($dupes.Count -gt 0) { exit 0 }
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing

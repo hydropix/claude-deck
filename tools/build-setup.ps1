@@ -15,6 +15,20 @@ $scriptDir = Join-Path $root 'scripts'
 $outCmd    = Join-Path $root 'ClaudeDeck-Setup.cmd'
 $marker    = '#@CDINSTALLER@#'
 
+# --- Version: derive scripts/version.txt from the latest git tag ------------
+# The git tag is the single source of truth (e.g. tag 'v1.1.0' -> version 1.1.0).
+# Falls back to the existing version.txt when the repo has no tags yet.
+$versionFile = Join-Path $scriptDir 'version.txt'
+$tag = (& git -C $root describe --tags --abbrev=0 2>$null)
+if ($LASTEXITCODE -eq 0 -and $tag) {
+  $version = ($tag -replace '^[vV]', '').Trim()
+  [System.IO.File]::WriteAllText($versionFile, "$version`r`n", (New-Object System.Text.UTF8Encoding($false)))
+  Write-Host ("Version (from git tag '{0}'): {1}" -f $tag, $version)
+} else {
+  $version = if (Test-Path $versionFile) { ([System.IO.File]::ReadAllText($versionFile)).Trim() } else { '0.0.0' }
+  Write-Host ("No git tag found - keeping version.txt as-is: {0}" -f $version) -ForegroundColor Yellow
+}
+
 # --- Embed every file under scripts/ as base64 ------------------------------
 $entries = Get-ChildItem $scriptDir -File | Sort-Object Name | ForEach-Object {
   $b64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($_.FullName))

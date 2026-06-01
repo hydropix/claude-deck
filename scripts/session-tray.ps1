@@ -63,9 +63,53 @@ public class WinFocus {
 }
 "@
 
-$stateDir  = Join-Path $env:USERPROFILE '.claude\sessions\state'
-$dndFlag   = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'
-$closeFlag = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'
+$stateDir    = Join-Path $env:USERPROFILE '.claude\sessions\state'
+$dndFlag     = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'
+$closeFlag   = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'
+$opacityFile = Join-Path $env:USERPROFILE '.claude\sessions\opacity.txt'   # 20..100 (window opacity %)
+$sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'      # 30..95  (window width, % of screen)
+
+# --- Optional auto-update (off by default) ---------------------------------
+# When autoUpdFlag is present, the tray periodically asks session-update.ps1 to
+# compare the installed version with the GitHub repo and writes update.json.
+$autoUpdFlag = Join-Path $env:USERPROFILE '.claude\sessions\autoupdate.flag'
+$updInfoFile = Join-Path $env:USERPROFILE '.claude\sessions\update.json'
+$updScript   = Join-Path $env:USERPROFILE '.claude\sessions\session-update.ps1'
+$verFile     = Join-Path $env:USERPROFILE '.claude\sessions\version.txt'
+$script:updNotified = $false
+
+function Get-LocalVersion {
+  try { if (Test-Path $verFile) { return ([System.IO.File]::ReadAllText($verFile)).Trim() } } catch {}
+  return $null
+}
+# Launch a version check / install in a hidden background process (never blocks the UI).
+function Invoke-Updater([string]$mode) {
+  if (-not (Test-Path $updScript)) { return }
+  Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $updScript), $mode
+  ) -ErrorAction SilentlyContinue
+}
+# Check only when enabled, and at most a couple of times a day (throttled via update.json).
+function Invoke-UpdateCheckThrottled {
+  if (-not (Test-Path $autoUpdFlag)) { return }
+  try {
+    if (Test-Path $updInfoFile) {
+      $j = [System.IO.File]::ReadAllText($updInfoFile) | ConvertFrom-Json
+      if ($j.checked -and ((Get-Date) - [datetime]$j.checked).TotalHours -lt 12) { return }
+    }
+  } catch {}
+  Invoke-Updater '-Check'
+}
+# Read the last check result -> the parsed object when an update is available, else $null.
+function Get-UpdateInfo {
+  try {
+    if (Test-Path $updInfoFile) {
+      $j = [System.IO.File]::ReadAllText($updInfoFile) | ConvertFrom-Json
+      if ($j.available) { return $j }
+    }
+  } catch {}
+  return $null
+}
 
 # Per-project accent colour (hash of name -> hue) + a small colour swatch icon.
 function Hue2Rgb($p, $q, $t) {
@@ -90,6 +134,14 @@ function New-Swatch($color) {
   $g = [System.Drawing.Graphics]::FromImage($bmp)
   $g.Clear($color); $g.Dispose()
   return $bmp
+}
+# Context occupied, compact: "117k (59%)" — empty when unknown (old state files).
+function Format-Ctx($s) {
+  $tok = $s.ctx_tokens
+  if ($null -eq $tok) { return '' }
+  $k = if ([int]$tok -ge 1000) { '{0}k' -f [int][math]::Round([int]$tok / 1000.0) } else { [string][int]$tok }
+  if ($null -ne $s.ctx_pct) { return ('{0} ({1}%)' -f $k, [int]$s.ctx_pct) }
+  return $k
 }
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
@@ -154,7 +206,9 @@ function Build-Menu {
       $age = if ($mins -lt 1) { "maintenant" } elseif ($mins -lt 60) { "${mins}m" } else { "$([int]($mins/60))h" }
       $it = New-Object System.Windows.Forms.ToolStripMenuItem
       $sep = [char]0x2014   # em dash, built from code point (no non-ASCII literal in source)
-      $it.Text = ('{0}  {1}   {2}   {3}   ({4})' -f $dot, $s.project, $sep, $p, $age)
+      $ctxStr = Format-Ctx $s
+      if ($ctxStr) { $it.Text = ('{0}  {1}   {2}   {3}   ({4})   {5} {6}' -f $dot, $s.project, $sep, $p, $age, [char]0x2022, $ctxStr) }
+      else         { $it.Text = ('{0}  {1}   {2}   {3}   ({4})' -f $dot, $s.project, $sep, $p, $age) }
       $it.ForeColor = $fc
       try { $it.Image = New-Swatch (Get-ProjectColor ([string]$s.project)) } catch {}   # per-project colour
       Add-Click $it ([string]$s.project) ([string]$s.cwd)
@@ -162,6 +216,17 @@ function Build-Menu {
     }
   }
   [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+  # Prominent "install update" entry, shown only when a newer version was found.
+  $upd = Get-UpdateInfo
+  if ($upd) {
+    $ui = New-Object System.Windows.Forms.ToolStripMenuItem(("Installer la mise a jour (v{0})" -f $upd.latest))
+    $ui.ForeColor = [System.Drawing.Color]::FromArgb(80, 160, 90)
+    $ui.ToolTipText = "Telecharge et execute le dernier ClaudeDeck-Setup.cmd depuis GitHub"
+    $ui.Add_Click({ Invoke-Updater '-Apply' })
+    [void]$menu.Items.Add($ui)
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+  }
 
   $dnd = New-Object System.Windows.Forms.ToolStripMenuItem('Ne pas deranger')
   $dnd.Checked = (Test-Path $dndFlag)
@@ -181,6 +246,69 @@ function Build-Menu {
   })
   [void]$menu.Items.Add($co)
 
+  # Transparency submenu — writes opacity % to opacity.txt (read live by the view).
+  $curOp = 92   # default: light transparency (Legere)
+  try { if (Test-Path $opacityFile) { $curOp = [int]((Get-Content $opacityFile -Raw -ErrorAction Stop).Trim()) } } catch {}
+  $opMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Transparence')
+  $opMenu.ToolTipText = "Rend la grande vue plus ou moins transparente"
+  foreach ($lvl in @(
+      @{ v = 100; l = 'Aucune (opaque)' },
+      @{ v = 92;  l = 'Legere' },
+      @{ v = 80;  l = 'Moyenne' },
+      @{ v = 65;  l = 'Forte' })) {
+    $mi = New-Object System.Windows.Forms.ToolStripMenuItem($lvl.l)
+    $mi.Checked = ($curOp -eq $lvl.v)
+    $val = $lvl.v
+    $mi.Add_Click({ Set-Content -LiteralPath $opacityFile -Value $val -Encoding ASCII -ErrorAction SilentlyContinue }.GetNewClosure())
+    [void]$opMenu.DropDownItems.Add($mi)
+  }
+  [void]$menu.Items.Add($opMenu)
+
+  # Size submenu — writes window width (% of screen) to size.txt (read live by the view).
+  $curSize = 55
+  try { if (Test-Path $sizeFile) { $curSize = [int]((Get-Content $sizeFile -Raw -ErrorAction Stop).Trim()) } } catch {}
+  $szMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Taille')
+  $szMenu.ToolTipText = "Largeur de la grande vue"
+  foreach ($sz in @(
+      @{ v = 42; l = 'Compacte' },
+      @{ v = 55; l = 'Normale' },
+      @{ v = 68; l = 'Large' },
+      @{ v = 82; l = 'Tres large' })) {
+    $mi = New-Object System.Windows.Forms.ToolStripMenuItem($sz.l)
+    $mi.Checked = ($curSize -eq $sz.v)
+    $val = $sz.v
+    $mi.Add_Click({ Set-Content -LiteralPath $sizeFile -Value $val -Encoding ASCII -ErrorAction SilentlyContinue }.GetNewClosure())
+    [void]$szMenu.DropDownItems.Add($mi)
+  }
+  [void]$menu.Items.Add($szMenu)
+
+  [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+  # Auto-update toggle (opt-in / off by default) + manual check.
+  $au = New-Object System.Windows.Forms.ToolStripMenuItem('Mises a jour automatiques')
+  $au.Checked = (Test-Path $autoUpdFlag)
+  $au.ToolTipText = "Verifie periodiquement le depot GitHub et propose d'installer les nouvelles versions"
+  $au.Add_Click({
+    if (Test-Path $autoUpdFlag) { Remove-Item $autoUpdFlag -Force -ErrorAction SilentlyContinue }
+    else { Set-Content -LiteralPath $autoUpdFlag -Value '' -Encoding ASCII; Invoke-Updater '-Check' }
+  })
+  [void]$menu.Items.Add($au)
+
+  $chk = $menu.Items.Add('Verifier les mises a jour')
+  $chk.ToolTipText = "Cherche maintenant une nouvelle version sur GitHub"
+  $chk.Add_Click({
+    Invoke-Updater '-Check'
+    try { $notify.ShowBalloonTip(3000, 'ClaudeDeck', 'Recherche de mises a jour...', [System.Windows.Forms.ToolTipIcon]::Info) } catch {}
+  })
+
+  $ver = Get-LocalVersion
+  if ($ver) {
+    $vi = $menu.Items.Add("ClaudeDeck v$ver")
+    $vi.Enabled = $false
+  }
+
+  [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
   $big = $menu.Items.Add('Afficher en grand')
   $big.Add_Click({
     $vbs = Join-Path $env:USERPROFILE '.claude\sessions\show-view.vbs'
@@ -196,6 +324,14 @@ $script:reminded = @{}
 $remindTimer = New-Object System.Windows.Forms.Timer
 $remindTimer.Interval = 60000   # check every minute
 $remindTimer.Add_Tick({
+  # Notify once per session when a new version is available (independent of DND).
+  if (-not $script:updNotified) {
+    $upd = Get-UpdateInfo
+    if ($upd) {
+      $script:updNotified = $true
+      try { $notify.ShowBalloonTip(6000, 'ClaudeDeck - mise a jour disponible', ("Version $($upd.latest) disponible. Clique l'icone -> Installer la mise a jour."), [System.Windows.Forms.ToolTipIcon]::Info) } catch {}
+    }
+  }
   if (Test-Path $dndFlag) { return }
   $now = Get-Date
   if (-not (Test-Path $stateDir)) { return }
@@ -211,6 +347,15 @@ $remindTimer.Add_Tick({
   }
 })
 $remindTimer.Start()
+
+# Auto-update: an initial check shortly after start, then hourly (throttled to ~12h).
+$updTimer = New-Object System.Windows.Forms.Timer
+$updTimer.Interval = 8000   # first tick ~8s after launch, then switches to hourly
+$updTimer.Add_Tick({
+  $updTimer.Interval = 3600000
+  Invoke-UpdateCheckThrottled
+})
+$updTimer.Start()
 
 $menu.Add_Opening({ Build-Menu })
 

@@ -76,14 +76,32 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 
 ## Options
 
-All options are toggles in the tray menu (state stored as small flag files under `~/.claude/sessions/`):
+Options live in the tray menu (state stored as small files under `~/.claude/sessions/`):
 
 | Option | Default | Effect |
 | --- | --- | --- |
 | **Ne pas deranger** (Do Not Disturb) | off | Suspends the auto-popup on task completion and the forgotten-task reminders. |
 | **Fermer au clic exterieur** (close on outside click) | **off** | When on, the overview also closes on a click anywhere outside it (0.5s grace to avoid accidental closes). `Esc` / **✕** always work. |
+| **Transparence** (transparency) | Legere (92 %) | Sets the overview window opacity: Aucune / Legere / Moyenne / Forte (100 / 92 / 80 / 65 %). Applied live. |
+| **Taille** (size) | Normale (55 %) | Sets the overview width: Compacte / Normale / Large / Tres large (42 / 55 / 68 / 82 % of screen width). Applied live. |
+| **Mises a jour automatiques** (auto-update) | **off** | When on, ClaudeDeck checks the GitHub repo a couple of times a day for a newer version. See [Updates](#updates). |
+
+**Position:** the overview header has three buttons next to **✕** — ▲ (top), ▬ (center), ▼ (bottom) — to dock the window to the top, middle, or bottom of the primary screen. The active one is highlighted; the choice is remembered.
 
 **Change the hotkey:** edit `$HotMods` / `$HotVk` near the bottom of `scripts/session-tray.ps1` (the modifier/virtual-key tables are in the comments). The Windows key alone is mostly reserved by the OS, so `Win+Alt+<key>` is the reliable space.
+
+## Updates
+
+ClaudeDeck can keep itself up to date from this GitHub repo — **opt-in, and off by default**.
+
+- Turn it on with the tray menu **Mises a jour automatiques** (or check on demand with **Verifier les mises a jour**).
+- When enabled, the tray compares the installed version (`~/.claude/sessions/version.txt`) with [`scripts/version.txt`](scripts/version.txt) on the `main` branch a couple of times a day. The check runs in a hidden background process, so it never blocks the UI; if you're offline it simply does nothing.
+- If a newer version exists you get a tray balloon and an **Installer la mise a jour (vX)** entry at the top of the menu. Clicking it downloads the latest [`ClaudeDeck-Setup.cmd`](ClaudeDeck-Setup.cmd) and runs it — the same idempotent installer, so it refreshes the scripts, re-merges hooks, and restarts the tray.
+- The current version is always shown at the bottom of the tray menu.
+
+> The updater lives in [`scripts/session-update.ps1`](scripts/session-update.ps1). Forking? Change the `$Owner` / `$Repo` / `$Branch` variables at the top so it points at your own repo.
+>
+> **Maintainers:** the version number comes from the latest **git tag** — that's the single source of truth. To publish a release: `git tag v1.1.0`, then run `tools/build-setup.ps1` (it writes `scripts/version.txt` from the tag and regenerates `ClaudeDeck-Setup.cmd`), then commit the regenerated `version.txt` + `.cmd` and push (`git push && git push --tags`). Installed clients with auto-update on pick it up on their next check.
 
 ## How it works
 

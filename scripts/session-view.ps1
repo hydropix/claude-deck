@@ -127,15 +127,43 @@ $dupes = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorA
   Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*session-view.ps1*' })
 if ($dupes.Count -gt 0) { exit 0 }
 
-$stateDir  = Join-Path $env:USERPROFILE '.claude\sessions\state'
-$closeFlag = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'   # opt-in: close on outside click
+$stateDir    = Join-Path $env:USERPROFILE '.claude\sessions\state'
+$closeFlag   = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'   # opt-in: close on outside click
+$posFile     = Join-Path $env:USERPROFILE '.claude\sessions\position.txt'        # top | center | bottom
+$opacityFile = Join-Path $env:USERPROFILE '.claude\sessions\opacity.txt'         # 20..100 (window opacity %)
+$sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'            # 30..95 (window width, % of screen)
+
+# Preferences (position + opacity + size) are re-read on every refresh so changes
+# from the tray menu apply live without reopening the view.
+$script:position = 'center'
+$script:opacity  = 0.92          # default: light transparency (Legere)
+$script:widthPct = 55            # default window width (% of screen)
+function Read-Prefs {
+  $script:position = 'center'
+  try { if (Test-Path $posFile) { $p = (Get-Content $posFile -Raw -ErrorAction Stop).Trim().ToLower(); if ($p -in @('top','center','bottom')) { $script:position = $p } } } catch {}
+  $script:opacity = 0.92         # default: light transparency (Legere)
+  try { if (Test-Path $opacityFile) { $v = [int]((Get-Content $opacityFile -Raw -ErrorAction Stop).Trim()); if ($v -ge 20 -and $v -le 100) { $script:opacity = $v / 100.0 } } } catch {}
+  $script:widthPct = 55          # default window width
+  try { if (Test-Path $sizeFile) { $w = [int]((Get-Content $sizeFile -Raw -ErrorAction Stop).Trim()); if ($w -ge 30 -and $w -le 95) { $script:widthPct = $w } } } catch {}
+}
+Read-Prefs
 
 # --- Sizing relative to the primary screen (looks right at any resolution) ---
 $screen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-$formW  = [int]($screen.Width  * 0.55)
+$formW  = [int]($screen.Width  * $script:widthPct / 100)
 $formH  = [int]($screen.Height * 0.70)
 $titlePt = [single]([math]::Max(20, $screen.Height / 60))   # ~ 24pt on 1440p, scales on 4K
 $rowPt   = [single]([math]::Max(15, $screen.Height / 85))
+
+# Vertical placement for a window of height $h, per the chosen position.
+function Get-FormTop($h) {
+  $margin = [int][math]::Max(24, $screen.Height * 0.04)
+  switch ($script:position) {
+    'top'    { return [int]($screen.Y + $margin) }
+    'bottom' { return [int]($screen.Y + $screen.Height - $h - $margin) }
+    default  { return [int]($screen.Y + ($screen.Height - $h) / 2) }
+  }
+}
 
 $bg     = [System.Drawing.Color]::FromArgb(24, 24, 28)
 $rowBg  = [System.Drawing.Color]::FromArgb(36, 36, 42)
@@ -163,6 +191,14 @@ function Get-ProjectColor($name) {
   $p = 2 * $l - $q
   $r = Hue2Rgb $p $q ($h + 1.0/3); $g = Hue2Rgb $p $q $h; $b = Hue2Rgb $p $q ($h - 1.0/3)
   return [System.Drawing.Color]::FromArgb([int]($r * 255), [int]($g * 255), [int]($b * 255))
+}
+# Context occupied, compact: "117k (59%)" — empty string when unknown (old state files).
+function Format-Ctx($s) {
+  $tok = $s.ctx_tokens
+  if ($null -eq $tok) { return '' }
+  $k = if ([int]$tok -ge 1000) { '{0}k' -f [int][math]::Round([int]$tok / 1000.0) } else { [string][int]$tok }
+  if ($null -ne $s.ctx_pct) { return ('{0} ({1}%)' -f $k, [int]$s.ctx_pct) }
+  return $k
 }
 function Get-Initials($name) {
   if (-not $name) { return '?' }
@@ -216,8 +252,9 @@ $form.FormBorderStyle = 'None'
 $form.StartPosition   = 'Manual'   # pin to the PRIMARY screen (with the taskbar), not the 2nd monitor
 $form.Size            = New-Object System.Drawing.Size($formW, $formH)
 $formLeft = [int]($screen.X + ($screen.Width - $formW) / 2)
-$form.Location        = New-Object System.Drawing.Point($formLeft, [int]($screen.Y + ($screen.Height - $formH) / 2))
+$form.Location        = New-Object System.Drawing.Point($formLeft, (Get-FormTop $formH))
 $form.BackColor       = $bg
+$form.Opacity         = $script:opacity
 $form.TopMost         = $true
 $form.ShowInTaskbar   = $true
 $form.Text            = $WindowTitle
@@ -255,6 +292,45 @@ $close.Add_MouseLeave({ $close.ForeColor = $grey })
 $close.Add_Click({ $form.Close() })
 $header.Controls.Add($close)
 
+# --- Position buttons (▲ top, ▬ middle, ▼ bottom) — to the left of X ---
+$posTip = New-Object System.Windows.Forms.ToolTip
+$posPt  = [single]($titlePt * 0.6)
+function New-PosButton($glyph, $tip) {
+  $b = New-Object System.Windows.Forms.Label
+  $b.Text = $glyph
+  $b.ForeColor = $grey
+  $b.Font = New-Object System.Drawing.Font('Segoe UI', $posPt, [System.Drawing.FontStyle]::Bold)
+  $b.AutoSize = $true
+  $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+  $posTip.SetToolTip($b, $tip)
+  $header.Controls.Add($b)
+  return $b
+}
+$script:posTop = New-PosButton ([char]0x25B2) 'Position : en haut'
+$script:posMid = New-PosButton ([char]0x25AC) 'Position : au centre'
+$script:posBot = New-PosButton ([char]0x25BC) 'Position : en bas'
+
+# Highlight the active position; the others stay dim.
+function Update-PosHighlight {
+  $script:posTop.ForeColor = if ($script:position -eq 'top')    { $white } else { $grey }
+  $script:posMid.ForeColor = if ($script:position -eq 'center') { $white } else { $grey }
+  $script:posBot.ForeColor = if ($script:position -eq 'bottom') { $white } else { $grey }
+}
+function Set-Position($pos) {
+  try { Set-Content -LiteralPath $posFile -Value $pos -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+  $script:position = $pos
+  $form.Top = Get-FormTop $form.Height
+  Update-PosHighlight
+}
+$script:posTop.Add_Click({ Set-Position 'top' })
+$script:posMid.Add_Click({ Set-Position 'center' })
+$script:posBot.Add_Click({ Set-Position 'bottom' })
+foreach ($pb in @($script:posTop, $script:posMid, $script:posBot)) {
+  $pb.Add_MouseEnter({ $this.ForeColor = [System.Drawing.Color]::FromArgb(120, 175, 240) }.GetNewClosure())
+  $pb.Add_MouseLeave({ Update-PosHighlight }.GetNewClosure())
+}
+Update-PosHighlight
+
 $hint = New-Object System.Windows.Forms.Label
 $hint.Text = 'Echap pour fermer'
 $hint.ForeColor = $grey
@@ -262,10 +338,16 @@ $hint.Font = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.7))
 $hint.AutoSize = $true
 $header.Controls.Add($hint)
 
-# Keep X and hint pinned to the right edge
+# Keep X, the position buttons and the hint pinned to the right edge.
+# Layout from the right:  [hint]  ▲ ▬ ▼   ✕
 $header.Add_Resize({
-  $close.Location = New-Object System.Drawing.Point(($header.Width - $close.Width - 20), [int](($headerH - $close.Height) / 2))
-  $hint.Location  = New-Object System.Drawing.Point(($header.Width - $close.Width - $hint.Width - 44), [int](($headerH - $hint.Height) / 2))
+  $cy = { param($c) [int](($headerH - $c.Height) / 2) }
+  $x  = $header.Width - 20
+  $x -= $close.Width;          $close.Location          = New-Object System.Drawing.Point($x, (& $cy $close))
+  $x -= ($script:posBot.Width + 18); $script:posBot.Location = New-Object System.Drawing.Point($x, (& $cy $script:posBot))
+  $x -= ($script:posMid.Width + 10); $script:posMid.Location = New-Object System.Drawing.Point($x, (& $cy $script:posMid))
+  $x -= ($script:posTop.Width + 10); $script:posTop.Location = New-Object System.Drawing.Point($x, (& $cy $script:posTop))
+  $x -= ($hint.Width + 24);    $hint.Location           = New-Object System.Drawing.Point($x, (& $cy $hint))
 })
 
 # Scrollable list
@@ -317,7 +399,9 @@ function Make-Row($s, $status, $seen, $promptText, $age) {
   $btn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, $rowMargin)
   $btn.TabStop = $false
   $sep = [char]0x2014
-  $rest = ('  {0}    {1}    {2}    ({3})' -f $s.project, $sep, $promptText, $age)
+  $ctxStr = Format-Ctx $s
+  $ctxPart = if ($ctxStr) { '    ' + [char]0x2022 + ' ' + $ctxStr } else { '' }   # • 117k (59%)
+  $rest = ('  {0}    {1}    {2}    ({3}){4}' -f $s.project, $sep, $promptText, $age, $ctxPart)
   $btn.Text = '  ' + $glyph + $rest
   if ($status -eq 'running') { $btn.Tag = $rest }   # spinner timer rewrites: '  ' + frame + Tag
   $btn.Add_Disposed({ param($snd, $e) try { if ($snd.Image) { $snd.Image.Dispose() } } catch {} })
@@ -390,6 +474,21 @@ $spinTimer.Add_Tick({
 $script:lastSig = $null
 
 function Refresh-List {
+  # Apply live preference changes (position + opacity + size).
+  Read-Prefs
+  Update-PosHighlight
+  if ($form.Opacity -ne $script:opacity) { $form.Opacity = $script:opacity }
+  $wantW = [int]($screen.Width * $script:widthPct / 100)
+  if ($script:formW -ne $wantW) {
+    $script:formW    = $wantW
+    $script:formLeft = [int]($screen.X + ($screen.Width - $wantW) / 2)
+    $form.Width      = $wantW
+    $form.Left       = $script:formLeft
+    $script:lastSig  = $null            # force a row rebuild so rows reflow to the new width
+  }
+  $wantTop = Get-FormTop $form.Height
+  if ($form.Top -ne $wantTop) { $form.Top = $wantTop }
+
   $now = Get-Date
   $sessions = @()
   if (Test-Path $stateDir) {
@@ -467,10 +566,11 @@ function Refresh-List {
   $maxH    = [int]($screen.Height * 0.9)
   $minH    = $headerH + $listPadV + ($rowH + $rowMargin) + 6
   $newH    = [math]::Min($maxH, [math]::Max($minH, $desired))
-  if ($form.Height -ne $newH -or $form.Left -ne $formLeft) {
+  $wantTop = Get-FormTop $newH
+  if ($form.Height -ne $newH -or $form.Left -ne $formLeft -or $form.Top -ne $wantTop) {
     $form.Height = $newH
     $form.Left   = $formLeft   # keep it on the primary screen, horizontally centered
-    $form.Top    = [int]($screen.Y + ($screen.Height - $newH) / 2)
+    $form.Top    = $wantTop    # top / center / bottom per the chosen position
   }
 
   # Drive animations: running rows spin; waiting rows breathe; a NEW completion flashes once.

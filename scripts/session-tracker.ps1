@@ -33,13 +33,13 @@ function Save($obj) { [System.IO.File]::WriteAllText($file, ($obj | ConvertTo-Js
 # Context occupied: read the last assistant message's token usage from the
 # session transcript (.jsonl). tokens = input + cache_creation + cache_read of
 # the most recent message = how full the context window currently is.
-# Window auto-detected from the model id (1M for "[1m]" models, else 200k).
+# We report raw tokens only — no %, since the model's true context window size
+# isn't reliably known (it varies by model and can't be trusted from the id).
 function Get-ContextInfo($transcriptPath) {
-  $res = @{ tokens = $null; pct = $null }
+  $res = @{ tokens = $null }
   try {
     if (-not $transcriptPath -or -not (Test-Path $transcriptPath)) { return $res }
     $lines  = Get-Content -LiteralPath $transcriptPath -Tail 120 -ErrorAction Stop
-    $window = 200000
     $tokens = $null
     foreach ($ln in $lines) {
       if (-not $ln) { continue }
@@ -51,19 +51,14 @@ function Get-ContextInfo($transcriptPath) {
         if ($null -ne $u.cache_read_input_tokens)     { $t += [int]$u.cache_read_input_tokens }
         $tokens = $t
       }
-      $m = [string]$o.message.model
-      if ($m) { $window = if ($m -match '(?i)1m') { 1000000 } else { 200000 } }
     }
-    if ($null -ne $tokens) {
-      $res.tokens = $tokens
-      $res.pct    = [int][math]::Round($tokens / $window * 100)
-    }
+    if ($null -ne $tokens) { $res.tokens = $tokens }
   } catch {}
   return $res
 }
-# Store context tokens/% onto an existing state object (idempotent add-or-set).
+# Store context tokens onto an existing state object (idempotent add-or-set).
 function Set-Ctx($o, $ctx) {
-  foreach ($pair in @(@('ctx_tokens', $ctx.tokens), @('ctx_pct', $ctx.pct))) {
+  foreach ($pair in @(@('ctx_tokens', $ctx.tokens))) {
     if ($o.PSObject.Properties.Name -contains $pair[0]) { $o.($pair[0]) = $pair[1] }
     else { $o | Add-Member -NotePropertyName $pair[0] -NotePropertyValue $pair[1] }
   }
@@ -83,7 +78,6 @@ switch ($Event) {
       status      = 'running'
       updated     = (Get-Date).ToString('o')
       ctx_tokens  = $ctx.tokens
-      ctx_pct     = $ctx.pct
     })
   }
   'stop' {
@@ -105,7 +99,6 @@ switch ($Event) {
         status      = 'done'
         updated     = (Get-Date).ToString('o')
         ctx_tokens  = $ctx.tokens
-        ctx_pct     = $ctx.pct
       })
     }
   }

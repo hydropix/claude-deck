@@ -135,13 +135,13 @@ function New-Swatch($color) {
   $g.Clear($color); $g.Dispose()
   return $bmp
 }
-# Context occupied, compact: "117k (59%)" — empty when unknown (old state files).
+# Context occupied, compact: "117k" — empty when unknown (old state files).
+# We show raw tokens only (no %), since the model's true context window isn't reliably known.
 function Format-Ctx($s) {
   $tok = $s.ctx_tokens
   if ($null -eq $tok) { return '' }
-  $k = if ([int]$tok -ge 1000) { '{0}k' -f [int][math]::Round([int]$tok / 1000.0) } else { [string][int]$tok }
-  if ($null -ne $s.ctx_pct) { return ('{0} ({1}%)' -f $k, [int]$s.ctx_pct) }
-  return $k
+  if ([int]$tok -ge 1000) { return '{0}k' -f [int][math]::Round([int]$tok / 1000.0) }
+  return [string][int]$tok
 }
 
 $notify = New-Object System.Windows.Forms.NotifyIcon

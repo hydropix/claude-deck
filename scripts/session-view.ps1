@@ -192,13 +192,13 @@ function Get-ProjectColor($name) {
   $r = Hue2Rgb $p $q ($h + 1.0/3); $g = Hue2Rgb $p $q $h; $b = Hue2Rgb $p $q ($h - 1.0/3)
   return [System.Drawing.Color]::FromArgb([int]($r * 255), [int]($g * 255), [int]($b * 255))
 }
-# Context occupied, compact: "117k (59%)" — empty string when unknown (old state files).
+# Context occupied, compact: "117k" — empty string when unknown (old state files).
+# We show raw tokens only (no %), since the model's true context window isn't reliably known.
 function Format-Ctx($s) {
   $tok = $s.ctx_tokens
   if ($null -eq $tok) { return '' }
-  $k = if ([int]$tok -ge 1000) { '{0}k' -f [int][math]::Round([int]$tok / 1000.0) } else { [string][int]$tok }
-  if ($null -ne $s.ctx_pct) { return ('{0} ({1}%)' -f $k, [int]$s.ctx_pct) }
-  return $k
+  if ([int]$tok -ge 1000) { return '{0}k' -f [int][math]::Round([int]$tok / 1000.0) }
+  return [string][int]$tok
 }
 function Get-Initials($name) {
   if (-not $name) { return '?' }

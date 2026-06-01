@@ -11,6 +11,7 @@ No Node, no Python, no dependencies — just PowerShell and a couple of Claude C
 - **System-tray icon** — click it for a compact list of your sessions.
 - **Large centered overview** — a big, readable panel (great on 4K). Opens automatically every time Claude finishes a task, or on demand.
 - **Live status per session** — 🟢 green dot = Claude is working, ⚪ grey dot = finished, with the last prompt and how long ago.
+- **"Who just finished?" highlight** — when the overview pops up, the row of the session that just completed pulses green for a moment, so you instantly see which one called you.
 - **Click to focus** — clicking a session brings its VS Code / Cursor window to the front **without resizing or moving it**.
 - **Follows you across virtual desktops** — the overview appears on whichever Windows virtual desktop you're currently on (uses only the documented `IVirtualDesktopManager` API, so it won't break on Windows updates).
 - **Pinned to the primary monitor** — always shows on the screen that has the taskbar, never drifts to a second monitor.

@@ -231,6 +231,44 @@ function Make-Row($s, $running, $promptText, $age) {
   return $btn
 }
 
+# --- Highlight animation: pulse the background of the row that just finished ---
+$script:animBtn     = $null
+$script:animBase    = $rowBg
+$script:animHi      = [System.Drawing.Color]::FromArgb(55, 140, 90)   # green "just completed" glow
+$script:animStart   = 0
+$script:lastAnimKey = $null
+
+function Blend-Color($a, $b, $m) {
+  $r  = [int]($a.R + ($b.R - $a.R) * $m)
+  $g  = [int]($a.G + ($b.G - $a.G) * $m)
+  $bl = [int]($a.B + ($b.B - $a.B) * $m)
+  return [System.Drawing.Color]::FromArgb($r, $g, $bl)
+}
+
+$animTimer = New-Object System.Windows.Forms.Timer
+$animTimer.Interval = 30
+$animTimer.Add_Tick({
+  if (-not $script:animBtn) { $animTimer.Stop(); return }
+  $elapsed = [Environment]::TickCount - $script:animStart
+  $dur = 2200
+  if ($elapsed -ge $dur) {
+    try { $script:animBtn.BackColor = $script:animBase } catch {}
+    $script:animBtn = $null; $animTimer.Stop(); return
+  }
+  $intensity = 1.0 - ($elapsed / $dur)                                    # fade 1 -> 0
+  $pulse = 0.5 - 0.5 * [math]::Cos(($elapsed / 650.0) * 2 * [math]::PI)   # 0..1, ~3 pulses
+  try { $script:animBtn.BackColor = (Blend-Color $script:animBase $script:animHi ($intensity * $pulse)) }
+  catch { $script:animBtn = $null; $animTimer.Stop() }
+})
+
+function Start-RowAnimation($btn) {
+  if (-not $btn) { return }
+  $script:animBtn   = $btn
+  $script:animBase  = $rowBg
+  $script:animStart = [Environment]::TickCount
+  $animTimer.Start()
+}
+
 $script:lastSig = $null
 
 function Refresh-List {
@@ -264,8 +302,18 @@ function Refresh-List {
   if ($sig -eq $script:lastSig) { return }
   $script:lastSig = $sig
 
+  # Which session just finished? (newest 'done' row = the one that triggered this update)
+  $triggerSid = $null; $triggerKey = $null
+  foreach ($r in $rows) {
+    if (-not $r.running) { $triggerSid = [string]$r.s.session_id; $triggerKey = $triggerSid + '|' + [string]$r.s.updated; break }
+  }
+
+  # The currently-animated button is about to be destroyed; stop first.
+  $animTimer.Stop(); $script:animBtn = $null
+
   $list.SuspendLayout()
   $list.Controls.Clear()
+  $triggerBtn = $null
   if ($rows.Count -eq 0) {
     $empty = New-Object System.Windows.Forms.Label
     $empty.Text = 'Aucune session active'
@@ -274,7 +322,11 @@ function Refresh-List {
     $empty.AutoSize = $true
     $list.Controls.Add($empty)
   } else {
-    foreach ($r in $rows) { $list.Controls.Add((Make-Row $r.s $r.running $r.p $r.age)) }
+    foreach ($r in $rows) {
+      $b = Make-Row $r.s $r.running $r.p $r.age
+      $list.Controls.Add($b)
+      if ($triggerSid -and ([string]$r.s.session_id -eq $triggerSid)) { $triggerBtn = $b }
+    }
   }
   $list.ResumeLayout()
 
@@ -288,6 +340,12 @@ function Refresh-List {
     $form.Height = $newH
     $form.Left   = $formLeft   # keep it on the primary screen, horizontally centered
     $form.Top    = [int]($screen.Y + ($screen.Height - $newH) / 2)
+  }
+
+  # Pulse the row that just finished, but only when it's a NEW completion.
+  if ($triggerKey -and ($triggerKey -ne $script:lastAnimKey)) {
+    $script:lastAnimKey = $triggerKey
+    Start-RowAnimation $triggerBtn
   }
 }
 

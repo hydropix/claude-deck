@@ -122,6 +122,10 @@ if ($existing -ne [System.IntPtr]::Zero) {
   [WinFocus]::RaiseWindow($existing)
   exit 0
 }
+# Race guard: another view process may be starting before its window exists.
+$dupes = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+  Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*session-view.ps1*' })
+if ($dupes.Count -gt 0) { exit 0 }
 
 $stateDir = Join-Path $env:USERPROFILE '.claude\sessions\state'
 

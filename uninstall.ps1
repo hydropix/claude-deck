@@ -52,7 +52,13 @@ if (Test-Path $settings) {
             }
           }
         }
-        if (-not $isOurs) { $kept += $grp }
+        if (-not $isOurs) {
+          # PS 5.1 ConvertFrom-Json unwraps single-element arrays; force the
+          # preserved group's inner 'hooks' back into a real array so we don't
+          # corrupt the user's other hooks on write.
+          if ($grp -is [System.Collections.IDictionary] -and $grp.Contains('hooks')) { $grp['hooks'] = @($grp['hooks']) }
+          $kept += $grp
+        }
       }
       if ($kept.Count -gt 0) { $hooks[$evt] = $kept } else { $hooks.Remove($evt) }
     }

@@ -71,6 +71,18 @@ Add-Hook $hooks 'Stop'             $trackerStop   '-Event stop'
 Add-Hook $hooks 'Stop'             $viewStop      'show-view.vbs'
 Add-Hook $hooks 'SessionEnd'       $trackerEnd    '-Event end'
 
+# Normalize: PS 5.1 ConvertFrom-Json unwraps single-element arrays into bare
+# objects, so re-running the installer would otherwise serialize hooks as
+# objects and break Claude Code ("Expected array, but received object"). Force
+# every event value and its inner 'hooks' back into real arrays before writing.
+foreach ($evt in @($hooks.Keys)) {
+  $grps = @($hooks[$evt])
+  foreach ($g in $grps) {
+    if ($g -is [System.Collections.IDictionary] -and $g.Contains('hooks')) { $g['hooks'] = @($g['hooks']) }
+  }
+  $hooks[$evt] = $grps
+}
+
 $cfg['hooks'] = $hooks
 $json = $cfg | ConvertTo-Json -Depth 30
 [System.IO.File]::WriteAllText($settings, $json, (New-Object System.Text.UTF8Encoding($false)))

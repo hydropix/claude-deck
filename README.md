@@ -2,29 +2,35 @@
 
 > A minimalist Windows dashboard to keep an eye on all your running [Claude Code](https://claude.com/claude-code) sessions at a glance — and jump straight to the right editor window.
 
-ClaudeDeck shows every open Claude Code session in one place: what each one is doing, whether Claude is **working** or **done**, and lets you click to focus the exact VS Code / Cursor window for that task. It lives in your system tray, with a large always-on-top overview that pops up whenever a task finishes.
+When you juggle several very different projects, two costs pile up: knowing **which session needs you**, and **reloading context** when you switch. ClaudeDeck shows every open Claude Code session in one place — whether Claude is **working**, **waiting for you**, or **done**, with the last prompt for each — and lets you click to focus the exact VS Code / Cursor window. It lives in your system tray, with a large always-on-top overview that pops up whenever a task finishes.
 
-No Node, no Python, no dependencies — just PowerShell and a couple of Claude Code hooks.
+No Node, no Python, no dependencies — just PowerShell and a few Claude Code hooks.
 
 ## Features
 
-- **System-tray icon** — click it for a compact list of your sessions.
-- **Large centered overview** — a big, readable panel (great on 4K). Opens automatically every time Claude finishes a task, or on demand. Dismiss it with `Esc` or the `✕`. Optionally (tray menu → *Fermer au clic exterieur*, **off by default**) it also closes on a click anywhere outside it, with a 0.5s grace to avoid accidental closes.
-- **Three live states** — a spinning indicator while Claude works, 🟠 **waiting for you** (permission / question), ⚪ finished — with the last prompt and elapsed time. Sessions that need you are sorted to the top and **breathe orange** so you never miss a blocked session.
-- **"Who just finished?" highlight** — when the overview pops up, the row of the session that just completed pulses green for a moment, so you instantly see which one called you.
-- **Per-project badge** — each project gets a stable colour + its initials in a square badge at the start of the row (and a swatch in the tray menu), so different repos are instantly distinguishable.
-- **Unopened-completion border** — a finished session you haven't opened yet gets a subtle blue outline; it clears the moment you click the row. Easy to see what's done but still unreviewed.
+### See everything at a glance
+
+- **System-tray icon** — click for a compact list of your sessions.
+- **Large centered overview** — a big, readable panel (great on 4K) that pops up automatically when a task finishes, or on demand. Auto-fits its height to the number of sessions; flicker-free (only repaints when something actually changes).
+- **Three live states** — a spinning indicator while Claude works, 🟠 **waiting for you** (permission / question), ⚪ finished — each with the last prompt and elapsed time. Sessions that need you sort to the top and **breathe orange**, so you never miss a blocked one.
+- **Per-project badge** — a stable colour + the project initials in a square badge at the start of each row (and a colour swatch in the tray menu), so different repos are instantly recognisable.
+
+### Know what just happened
+
+- **"Who just finished?" highlight** — when the overview pops up, the row of the session that just completed pulses green for a moment.
+- **Unopened-completion border** — a finished session you haven't opened yet gets a subtle blue outline; it clears the moment you click the row.
+- **Forgotten-task reminder** — a gentle nudge if a finished task sits unattended for a while.
+
+### Act fast
+
+- **Click to focus** — clicking a session brings its VS Code / Cursor window to the front, **without resizing or moving it**.
 - **Global hotkey** — `Win+Alt+C` opens/focuses the overview from anywhere (configurable; falls back automatically if the combo is taken).
-- **Do Not Disturb** — toggle in the tray menu: suspends the auto-popup and reminders while you're deep-focused on one project.
-- **Forgotten-task reminder** — a gentle nudge if a finished task sits unattended for a while (off during DND).
-- **Click to focus** — clicking a session brings its VS Code / Cursor window to the front **without resizing or moving it**.
-- **Follows you across virtual desktops** — the overview appears on whichever Windows virtual desktop you're currently on (uses only the documented `IVirtualDesktopManager` API, so it won't break on Windows updates).
-- **Pinned to the primary monitor** — always shows on the screen that has the taskbar, never drifts to a second monitor.
-- **Flicker-free** — only repaints when something actually changes.
+- **Follows you across virtual desktops** — the overview appears on whichever Windows virtual desktop you're on (uses only the documented `IVirtualDesktopManager` API, so it won't break on Windows updates).
+- **Pinned to the primary monitor** — always shows on the screen with the taskbar, never drifts to a second monitor.
 
 ## Screenshots
 
-> _Add your screenshots here (`docs/tray.png`, `docs/overview.png`)._
+> *Add your screenshots here (`docs/tray.png`, `docs/overview.png`).*
 
 ## Requirements
 
@@ -52,12 +58,23 @@ The installer will:
 
 ## Usage
 
-- **Tray icon** → click for the compact session list. Click a row to focus that session's editor window.
-- **Large view** → opens automatically when a task finishes, or via the **ClaudeDeck (grand)** desktop shortcut, the tray menu **Afficher en grand**, or the global hotkey **`Win+Alt+C`**. Close it with the **✕** or **Esc**.
+- **Tray icon** → click for the compact session list; click a row to focus that session's editor window.
+- **Large view** → opens automatically when a task finishes, or via the global hotkey **`Win+Alt+C`**, the **ClaudeDeck (grand)** desktop shortcut, or the tray menu **Afficher en grand**. Close it with **`Esc`** or the **✕**.
+
+## Options
+
+All options are toggles in the tray menu (state stored as small flag files under `~/.claude/sessions/`):
+
+| Option | Default | Effect |
+| --- | --- | --- |
+| **Ne pas deranger** (Do Not Disturb) | off | Suspends the auto-popup on task completion and the forgotten-task reminders. |
+| **Fermer au clic exterieur** (close on outside click) | **off** | When on, the overview also closes on a click anywhere outside it (0.5s grace to avoid accidental closes). `Esc` / **✕** always work. |
+
+**Change the hotkey:** edit `$HotMods` / `$HotVk` near the bottom of `scripts/session-tray.ps1` (the modifier/virtual-key tables are in the comments). The Windows key alone is mostly reserved by the OS, so `Win+Alt+<key>` is the reliable space.
 
 ## How it works
 
-Three Claude Code hooks write a tiny JSON state file per session under `~/.claude/sessions/state/`:
+A few Claude Code hooks write a tiny JSON state file per session under `~/.claude/sessions/state/`:
 
 | Hook | Action |
 | --- | --- |
@@ -68,10 +85,10 @@ Three Claude Code hooks write a tiny JSON state file per session under `~/.claud
 
 Two PowerShell apps read those files:
 
-- `session-tray.ps1` — the tray icon and compact menu.
+- `session-tray.ps1` — the tray icon, compact menu, global hotkey, and reminders.
 - `session-view.ps1` — the large always-on-top overview.
 
-Clicking a session resolves the matching IDE window by its title (e.g. `… - MyProject - Visual Studio Code`) and brings it to the foreground.
+Clicking a session resolves the matching IDE window by its title (e.g. `… - MyProject - Visual Studio Code`) and brings it to the foreground; if no window matches, it falls back to opening the folder in the real VS Code.
 
 ## Uninstall
 
@@ -84,8 +101,10 @@ Removes the scripts, the shortcuts, and the ClaudeDeck hooks from `settings.json
 ## Notes & limitations
 
 - Hooks use Claude Code's `"shell": "powershell"` option.
+- The **waiting** state is detected from permission/approval notifications; idle and auth notifications are ignored.
 - Click-to-focus matches the project folder name in the window title; sessions opened directly in your home folder may not match (no folder name in the title).
 - The large view "follows" you to the active virtual desktop within ~350 ms of switching.
+- Per-project colours come from a hash of the project name, so two names can occasionally land on a similar hue.
 
 ## License
 

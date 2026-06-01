@@ -41,13 +41,26 @@ No Node, no Python, no dependencies — just PowerShell and a few Claude Code ho
 
 ## Install
 
+### One file, one click (recommended)
+
+1. Download **[`ClaudeDeck-Setup.cmd`](ClaudeDeck-Setup.cmd)** (right-click → *Save link as…*).
+2. Double-click it.
+
+That's it. It's a single self-contained file — every script is embedded inside it, so there's nothing else to download and it works offline. No Node, no Python, no `git`.
+
+> **First run:** Windows may show *"Windows protected your PC"* (SmartScreen) or a *"Do you want to run this file?"* prompt, because the file isn't code-signed. Click **More info → Run anyway** (or **Run**). You can inspect the file in any text editor first — it's plain text.
+
+### From source (developers)
+
 ```powershell
 git clone https://github.com/hydropix/claude-deck.git
 cd claude-deck
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-The installer will:
+> **Maintainers:** `ClaudeDeck-Setup.cmd` is generated from `install.ps1` + `scripts/`. After changing either, regenerate it with `powershell -ExecutionPolicy Bypass -File .\tools\build-setup.ps1` (and optionally verify the embed with `.\tools\verify-bundle.ps1`), then commit the updated `.cmd`.
+
+### What the installer does (either way)
 
 1. Copy the scripts to `%USERPROFILE%\.claude\sessions\`.
 2. Merge the required hooks into `%USERPROFILE%\.claude\settings.json` (idempotent — it backs up the file first and never removes your existing hooks).

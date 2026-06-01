@@ -10,8 +10,11 @@ No Node, no Python, no dependencies — just PowerShell and a couple of Claude C
 
 - **System-tray icon** — click it for a compact list of your sessions.
 - **Large centered overview** — a big, readable panel (great on 4K). Opens automatically every time Claude finishes a task, or on demand.
-- **Live status per session** — 🟢 green dot = Claude is working, ⚪ grey dot = finished, with the last prompt and how long ago.
+- **Three live states** — 🟢 working, 🟠 **waiting for you** (permission / question), ⚪ finished — with the last prompt and elapsed time. Sessions that need you are sorted to the top and **breathe orange** so you never miss a blocked session.
 - **"Who just finished?" highlight** — when the overview pops up, the row of the session that just completed pulses green for a moment, so you instantly see which one called you.
+- **Per-project colours** — each project gets a stable accent colour (row border in the overview, swatch in the tray menu) so different repos are instantly distinguishable.
+- **Do Not Disturb** — toggle in the tray menu: suspends the auto-popup and reminders while you're deep-focused on one project.
+- **Forgotten-task reminder** — a gentle nudge if a finished task sits unattended for a while (off during DND).
 - **Click to focus** — clicking a session brings its VS Code / Cursor window to the front **without resizing or moving it**.
 - **Follows you across virtual desktops** — the overview appears on whichever Windows virtual desktop you're currently on (uses only the documented `IVirtualDesktopManager` API, so it won't break on Windows updates).
 - **Pinned to the primary monitor** — always shows on the screen that has the taskbar, never drifts to a second monitor.
@@ -57,7 +60,8 @@ Three Claude Code hooks write a tiny JSON state file per session under `~/.claud
 | Hook | Action |
 | --- | --- |
 | `UserPromptSubmit` | mark the session **running** + record the prompt |
-| `Stop` | mark the session **done** + pop the large overview |
+| `Notification` | mark the session **waiting** when Claude needs a permission/approval |
+| `Stop` | mark the session **done** + pop the large overview (unless DND) |
 | `SessionEnd` | remove the session |
 
 Two PowerShell apps read those files:

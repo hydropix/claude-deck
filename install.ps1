@@ -59,11 +59,14 @@ $hooks = $cfg['hooks']
 $trackerPrompt = '& "$env:USERPROFILE\.claude\sessions\session-tracker.ps1" -Event prompt'
 $trackerStop   = '& "$env:USERPROFILE\.claude\sessions\session-tracker.ps1" -Event stop'
 $trackerEnd    = '& "$env:USERPROFILE\.claude\sessions\session-tracker.ps1" -Event end'
+$trackerNotify = '& "$env:USERPROFILE\.claude\sessions\session-tracker.ps1" -Event notify'
+# The large view auto-opens on Stop, unless "Ne pas deranger" (dnd.flag) is set.
 $viewStop = (@'
-Start-Process wscript.exe -ArgumentList ('"' + (Join-Path $env:USERPROFILE '.claude\sessions\show-view.vbs') + '"')
+if (-not (Test-Path "$env:USERPROFILE\.claude\sessions\dnd.flag")) { Start-Process wscript.exe -ArgumentList ('"' + (Join-Path $env:USERPROFILE '.claude\sessions\show-view.vbs') + '"') }
 '@).Trim()
 
 Add-Hook $hooks 'UserPromptSubmit' $trackerPrompt '-Event prompt'
+Add-Hook $hooks 'Notification'     $trackerNotify '-Event notify'
 Add-Hook $hooks 'Stop'             $trackerStop   '-Event stop'
 Add-Hook $hooks 'Stop'             $viewStop      'show-view.vbs'
 Add-Hook $hooks 'SessionEnd'       $trackerEnd    '-Event end'

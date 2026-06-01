@@ -126,8 +126,28 @@ $bg     = [System.Drawing.Color]::FromArgb(24, 24, 28)
 $rowBg  = [System.Drawing.Color]::FromArgb(36, 36, 42)
 $hover  = [System.Drawing.Color]::FromArgb(52, 52, 62)
 $green  = [System.Drawing.Color]::FromArgb(80, 220, 130)
+$orange = [System.Drawing.Color]::FromArgb(245, 175, 70)   # "waiting for you"
 $grey   = [System.Drawing.Color]::FromArgb(150, 150, 158)
 $white  = [System.Drawing.Color]::FromArgb(235, 235, 240)
+
+# Stable per-project accent colour (hash of the name -> hue).
+function Hue2Rgb($p, $q, $t) {
+  if ($t -lt 0) { $t += 1 }; if ($t -gt 1) { $t -= 1 }
+  if ($t -lt (1.0/6)) { return $p + ($q - $p) * 6 * $t }
+  if ($t -lt 0.5)     { return $q }
+  if ($t -lt (2.0/3)) { return $p + ($q - $p) * ((2.0/3) - $t) * 6 }
+  return $p
+}
+function Get-ProjectColor($name) {
+  if (-not $name) { $name = '?' }
+  $hsh = 0
+  foreach ($c in $name.ToCharArray()) { $hsh = [int](($hsh * 31 + [int]$c) % 360) }
+  $h = $hsh / 360.0; $s = 0.55; $l = 0.62
+  $q = if ($l -lt 0.5) { $l * (1 + $s) } else { $l + $s - $l * $s }
+  $p = 2 * $l - $q
+  $r = Hue2Rgb $p $q ($h + 1.0/3); $g = Hue2Rgb $p $q $h; $b = Hue2Rgb $p $q ($h - 1.0/3)
+  return [System.Drawing.Color]::FromArgb([int]($r * 255), [int]($g * 255), [int]($b * 255))
+}
 
 $form = New-Object System.Windows.Forms.Form
 $form.FormBorderStyle = 'None'
@@ -202,13 +222,19 @@ $list.BringToFront()
 $rowH = [int]($rowPt * 3.4)
 $rowMargin = 10
 
-function Make-Row($s, $running, $promptText, $age) {
+function Make-Row($s, $status, $promptText, $age) {
   $btn = New-Object System.Windows.Forms.Button
   $btn.FlatStyle = 'Flat'
-  $btn.FlatAppearance.BorderSize = 0
+  $btn.FlatAppearance.BorderSize  = 2
+  $btn.FlatAppearance.BorderColor = (Get-ProjectColor ([string]$s.project))   # per-project accent
   $btn.FlatAppearance.MouseOverBackColor = $hover
   $btn.BackColor = $rowBg
-  $btn.ForeColor = if ($running) { $green } else { $grey }
+  switch ($status) {
+    'running' { $fc = $green;  $dot = [char]0x25CF }   # ●
+    'waiting' { $fc = $orange; $dot = [char]0x25CF }   # ●
+    default   { $fc = $grey;   $dot = [char]0x25CB }   # ○
+  }
+  $btn.ForeColor = $fc
   $btn.Font = New-Object System.Drawing.Font('Segoe UI', $rowPt)
   $btn.TextAlign = 'MiddleLeft'
   $btn.Padding = New-Object System.Windows.Forms.Padding(18, 0, 18, 0)
@@ -216,7 +242,6 @@ function Make-Row($s, $running, $promptText, $age) {
   $btn.Height = $rowH
   $btn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, $rowMargin)
   $btn.TabStop = $false
-  $dot = if ($running) { [char]0x25CF } else { [char]0x25CB }
   $sep = [char]0x2014
   $btn.Text = ('{0}   {1}    {2}    {3}    ({4})' -f $dot, $s.project, $sep, $promptText, $age)
   $proj = [string]$s.project
@@ -231,11 +256,14 @@ function Make-Row($s, $running, $promptText, $age) {
   return $btn
 }
 
-# --- Highlight animation: pulse the background of the row that just finished ---
-$script:animBtn     = $null
-$script:animBase    = $rowBg
-$script:animHi      = [System.Drawing.Color]::FromArgb(55, 140, 90)   # green "just completed" glow
-$script:animStart   = 0
+# --- Row background animations ---
+#   * waiting rows  -> continuous orange "breathing" (needs your attention)
+#   * just-finished -> transient green flash (which session called you)
+$script:waitBtns    = @()                                              # buttons currently waiting
+$script:flashBtn    = $null
+$script:flashStart  = 0
+$script:greenHi     = [System.Drawing.Color]::FromArgb(55, 140, 90)
+$script:orangeHi    = [System.Drawing.Color]::FromArgb(150, 95, 25)    # blended toward, behind orange text
 $script:lastAnimKey = $null
 
 function Blend-Color($a, $b, $m) {
@@ -246,28 +274,27 @@ function Blend-Color($a, $b, $m) {
 }
 
 $animTimer = New-Object System.Windows.Forms.Timer
-$animTimer.Interval = 30
+$animTimer.Interval = 33
 $animTimer.Add_Tick({
-  if (-not $script:animBtn) { $animTimer.Stop(); return }
-  $elapsed = [Environment]::TickCount - $script:animStart
-  $dur = 2200
-  if ($elapsed -ge $dur) {
-    try { $script:animBtn.BackColor = $script:animBase } catch {}
-    $script:animBtn = $null; $animTimer.Stop(); return
+  $t = [Environment]::TickCount
+  # waiting rows breathe (orange)
+  $breathe = 0.30 + 0.30 * (0.5 - 0.5 * [math]::Cos(($t / 900.0) * 2 * [math]::PI))   # ~0.0..0.6
+  foreach ($b in @($script:waitBtns)) {
+    try { $b.BackColor = (Blend-Color $rowBg $script:orangeHi $breathe) } catch {}
   }
-  $intensity = 1.0 - ($elapsed / $dur)                                    # fade 1 -> 0
-  $pulse = 0.5 - 0.5 * [math]::Cos(($elapsed / 650.0) * 2 * [math]::PI)   # 0..1, ~3 pulses
-  try { $script:animBtn.BackColor = (Blend-Color $script:animBase $script:animHi ($intensity * $pulse)) }
-  catch { $script:animBtn = $null; $animTimer.Stop() }
+  # just-finished flash (green, fades out over 2.2s, ~3 pulses)
+  if ($script:flashBtn) {
+    $el = $t - $script:flashStart
+    if ($el -ge 2200) {
+      try { $script:flashBtn.BackColor = $rowBg } catch {}
+      $script:flashBtn = $null
+    } else {
+      $m = (1.0 - ($el / 2200.0)) * (0.5 - 0.5 * [math]::Cos(($el / 650.0) * 2 * [math]::PI))
+      try { $script:flashBtn.BackColor = (Blend-Color $rowBg $script:greenHi $m) } catch { $script:flashBtn = $null }
+    }
+  }
+  if ((@($script:waitBtns).Count -eq 0) -and (-not $script:flashBtn)) { $animTimer.Stop() }
 })
-
-function Start-RowAnimation($btn) {
-  if (-not $btn) { return }
-  $script:animBtn   = $btn
-  $script:animBase  = $rowBg
-  $script:animStart = [Environment]::TickCount
-  $animTimer.Start()
-}
 
 $script:lastSig = $null
 
@@ -284,36 +311,43 @@ function Refresh-List {
   }
   $sessions = @($sessions | Sort-Object { $_.upd } -Descending)
 
-  # Build display rows
+  # Build display rows (status + duration)
   $rows = @()
   foreach ($e in $sessions) {
     $s = $e.s
-    $running = ($s.status -eq 'running')
+    $status = [string]$s.status
+    if ($status -ne 'running' -and $status -ne 'waiting') { $status = 'done' }
     $p = [string]$s.last_prompt
     if (-not $p) { $p = '(pas de demande)' }
     if ($p.Length -gt 90) { $p = $p.Substring(0, 90) + [char]0x2026 }
     $mins = [int]($now - $e.upd).TotalMinutes
     $age = if ($mins -lt 1) { 'maintenant' } elseif ($mins -lt 60) { "${mins}m" } else { "$([int]($mins / 60))h" }
-    $rows += [pscustomobject]@{ s = $s; running = $running; p = $p; age = $age }
+    $order = switch ($status) { 'waiting' { 0 } 'running' { 1 } default { 2 } }
+    $rows += [pscustomobject]@{ s = $s; status = $status; p = $p; age = $age; order = $order; upd = $e.upd }
   }
+  # Sort: waiting first, then running, then done; newest within each group.
+  $rows = @($rows | Sort-Object @{ Expression = 'order' }, @{ Expression = 'upd'; Descending = $true })
 
   # Anti-flicker: only rebuild when the displayed content actually changed.
-  $sig = ($rows | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.s.project, $_.running, $_.p, $_.age }) -join "`n"
+  $sig = ($rows | ForEach-Object { '{0}|{1}|{2}|{3}' -f $_.s.project, $_.status, $_.p, $_.age }) -join "`n"
   if ($sig -eq $script:lastSig) { return }
   $script:lastSig = $sig
 
   # Which session just finished? (newest 'done' row = the one that triggered this update)
   $triggerSid = $null; $triggerKey = $null
   foreach ($r in $rows) {
-    if (-not $r.running) { $triggerSid = [string]$r.s.session_id; $triggerKey = $triggerSid + '|' + [string]$r.s.updated; break }
+    if ($r.status -eq 'done') { $triggerSid = [string]$r.s.session_id; $triggerKey = $triggerSid + '|' + [string]$r.s.updated; break }
   }
 
-  # The currently-animated button is about to be destroyed; stop first.
-  $animTimer.Stop(); $script:animBtn = $null
+  # Buttons are about to be recreated; reset animation targets.
+  $animTimer.Stop()
+  $script:waitBtns = @()
+  $script:flashBtn = $null
 
   $list.SuspendLayout()
   $list.Controls.Clear()
   $triggerBtn = $null
+  $waiting = @()
   if ($rows.Count -eq 0) {
     $empty = New-Object System.Windows.Forms.Label
     $empty.Text = 'Aucune session active'
@@ -323,8 +357,9 @@ function Refresh-List {
     $list.Controls.Add($empty)
   } else {
     foreach ($r in $rows) {
-      $b = Make-Row $r.s $r.running $r.p $r.age
+      $b = Make-Row $r.s $r.status $r.p $r.age
       $list.Controls.Add($b)
+      if ($r.status -eq 'waiting') { $waiting += $b }
       if ($triggerSid -and ([string]$r.s.session_id -eq $triggerSid)) { $triggerBtn = $b }
     }
   }
@@ -342,11 +377,14 @@ function Refresh-List {
     $form.Top    = [int]($screen.Y + ($screen.Height - $newH) / 2)
   }
 
-  # Pulse the row that just finished, but only when it's a NEW completion.
+  # Drive animations: waiting rows breathe; a NEW completion flashes once.
+  $script:waitBtns = $waiting
   if ($triggerKey -and ($triggerKey -ne $script:lastAnimKey)) {
     $script:lastAnimKey = $triggerKey
-    Start-RowAnimation $triggerBtn
+    $script:flashBtn    = $triggerBtn
+    $script:flashStart  = [Environment]::TickCount
   }
+  if ((@($script:waitBtns).Count -gt 0) -or $script:flashBtn) { $animTimer.Start() }
 }
 
 $timer = New-Object System.Windows.Forms.Timer

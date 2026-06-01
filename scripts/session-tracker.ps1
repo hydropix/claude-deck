@@ -1,7 +1,7 @@
 # Claude Code session tracker — called by hooks.
 # Writes one JSON state file per session under .claude\sessions\state\
 # Never throws into Claude Code: any failure -> silent exit 0.
-param([ValidateSet('prompt','stop','end')][string]$Event = 'prompt')
+param([ValidateSet('prompt','stop','end','notify')][string]$Event = 'prompt')
 
 $ErrorActionPreference = 'SilentlyContinue'
 
@@ -60,6 +60,23 @@ switch ($Event) {
         status      = 'done'
         updated     = (Get-Date).ToString('o')
       })
+    }
+  }
+  'notify' {
+    # Claude needs the user (permission request, question, etc.).
+    # Scoped by the hook matcher; we also ignore the noisy idle notification.
+    if (Test-Path $file) {
+      $msg = ([string]$data.message -replace '\s+', ' ').Trim()
+      # Only treat genuine "needs you" notifications (permission/approval) as waiting,
+      # never the noisy idle prompt or auth notifications.
+      if ($msg -match '(?i)permission|approv|confirm|allow|grant') {
+        $o = [System.IO.File]::ReadAllText($file) | ConvertFrom-Json
+        $o.status  = 'waiting'
+        $o.updated = (Get-Date).ToString('o')
+        if ($o.PSObject.Properties.Name -contains 'waiting_msg') { $o.waiting_msg = $msg }
+        else { $o | Add-Member -NotePropertyName waiting_msg -NotePropertyValue $msg }
+        Save $o
+      }
     }
   }
   'end' { Remove-Item -LiteralPath $file -Force -ErrorAction SilentlyContinue }

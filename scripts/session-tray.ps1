@@ -190,9 +190,55 @@ $WORK_PROCS = @(
   'houdini','houdinifx','zbrush','substance painter','photoshop','illustrator','afterfx',
   'adobe premiere pro','windowsterminal','wt','alacritty','wezterm-gui','wezterm','conemu64')
 $BROWSER_PROCS = @('chrome','firefox','msedge','edge','brave','opera','vivaldi','arc','librewolf','zen','waterfox')
+
+# Hybrid browser model: inside a browser, a WORK_KEYS hit -> 'work', else a
+# DISTRACT_KEYS hit -> 'distract', else 'neutral' (the gray zone, never penalised).
+# Both are matched as lowercase substrings of the window TITLE (tab titles rarely
+# show the bare domain), so the tokens are brand/name fragments, not domains.
+# Short/ambiguous tokens (aws, ign, max, monday) are deliberately omitted - they
+# collide with ordinary words (draws, design, 3dsmax, the weekday).
+$WORK_KEYS = @(
+  # code / dev
+  'github','gitlab','bitbucket','stack overflow','stackoverflow','localhost',
+  '127.0.0.1','codepen','codesandbox','jsfiddle','replit','dev.to','mdn',
+  'developer.mozilla','caniuse','can i use','regex101','leetcode','codewars','npm',
+  # ai assistants
+  'claude','chatgpt','openai','gemini','copilot','perplexity','huggingface',
+  # project / docs / comms
+  'jira','confluence','notion','linear','asana','trello','clickup','slack',
+  'obsidian','monday.com','docs',
+  # design
+  'figma','framer','miro','excalidraw','dribbble','behance','adobe','canva',
+  # cloud / deploy
+  'vercel','netlify','cloudflare','supabase','firebase','heroku','digitalocean')
 $DISTRACT_KEYS = @(
-  'youtube','reddit','twitter','x.com',' / x','facebook','instagram','tiktok','netflix',
-  'twitch','9gag','pinterest','prime video','disney+','hulu','dailymotion')
+  # social
+  'facebook','instagram','twitter','x.com',' / x','tiktok','snapchat','reddit',
+  'tumblr','pinterest','mastodon','bluesky','threads',
+  # video / streaming
+  'youtube','netflix','twitch','vimeo','prime video','disney+','hulu',
+  'dailymotion','crunchyroll','hbo',
+  # fun / time-sinks
+  '9gag','buzzfeed','imgur','deviantart',
+  # shopping
+  'amazon','ebay','aliexpress','etsy','temu',
+  # gaming
+  'steam','epic games')
+
+# Optional per-user extensions: one keyword per line, lowercase substring match on
+# the browser tab title; blank lines and #comments are ignored. Merged once at tray
+# start - edit the file then restart the tray to apply. worksites.txt extends the
+# work whitelist, distractions.txt extends the distraction blocklist.
+function Read-KeyList([string]$path) {
+  if (-not (Test-Path $path)) { return @() }
+  try {
+    return @(Get-Content $path -ErrorAction Stop |
+      ForEach-Object { $_.Trim().ToLower() } |
+      Where-Object { $_ -and (-not $_.StartsWith('#')) })
+  } catch { return @() }
+}
+$WORK_KEYS     += Read-KeyList (Join-Path $env:USERPROFILE '.claude\sessions\worksites.txt')
+$DISTRACT_KEYS += Read-KeyList (Join-Path $env:USERPROFILE '.claude\sessions\distractions.txt')
 
 function Get-AppLabel($pname) {
   switch -Regex ($pname) {
@@ -223,6 +269,11 @@ function Get-PomoCategory {
   $isBrowser = $false
   foreach ($b in $BROWSER_PROCS) { if ($pname -eq $b) { $isBrowser = $true; break } }
   if ($isBrowser) {
+    # Hybrid: a work site wins, then a known distraction; anything else in a
+    # browser falls through to 'neutral' (the gray zone is never penalised).
+    foreach ($k in $WORK_KEYS) {
+      if ($tl.Contains($k)) { return @{ cat = 'work'; label = (Get-Culture).TextInfo.ToTitleCase($k.Trim()) } }
+    }
     foreach ($k in $DISTRACT_KEYS) {
       if ($tl.Contains($k)) { return @{ cat = 'distract'; label = (Get-Culture).TextInfo.ToTitleCase($k.Trim()) } }
     }
@@ -376,6 +427,70 @@ $pomoTimer.Add_Tick({
 })
 $pomoTimer.Start()
 Write-Pomo   # publish an initial state file immediately
+
+# ============================================================================
+# Focus nudge
+# When NO Claude session is active and you've drifted onto a distracting app,
+# Claude - who is bored and rather keen on your projects - pokes you with the
+# gentle chime and a flash of the deck (stamped via focus-nudge.txt, which the
+# deck watches). Opt-in via focus.flag (toggled from the deck's gear menu),
+# silenced by Do-Not-Disturb, and throttled so it never turns into a pest. It
+# reuses the Pomodoro engine's foreground classifier.
+# ============================================================================
+$focusFlag      = Join-Path $env:USERPROFILE '.claude\sessions\focus.flag'
+$dndFlag        = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'
+$stateDir       = Join-Path $env:USERPROFILE '.claude\sessions\state'
+$nudgeSignal    = Join-Path $env:USERPROFILE '.claude\sessions\focus-nudge.txt'  # tray stamps [Environment]::TickCount here on each nudge; the deck flashes when it's fresh
+$NUDGE_GAP_MS   = 180000   # at most one nudge per 3 minutes
+$ACTIVE_WIN_MIN = 30       # a running/waiting session counts as active only if touched within 30 min
+$script:lastNudge = 0      # [Environment]::TickCount of the last nudge (0 = never)
+
+# A session is "active" (so Claude is NOT bored) when any state file is running or
+# waiting AND was touched recently - a stale 'running' from a dead session must not
+# suppress the nudge forever.
+function Any-SessionActive {
+  if (-not (Test-Path $stateDir)) { return $false }
+  $now = Get-Date
+  foreach ($f in Get-ChildItem $stateDir -Filter *.json -ErrorAction SilentlyContinue) {
+    try {
+      $o = [System.IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json
+      $upd = $f.LastWriteTime
+      try { $upd = [datetime]$o.updated } catch {}
+      if (($now - $upd).TotalMinutes -gt $ACTIVE_WIN_MIN) { continue }
+      if ($o.status -eq 'running' -or $o.status -eq 'waiting') { return $true }
+    } catch {}
+  }
+  return $false
+}
+
+# Every 20s: if enabled, not DND, off cooldown, no active session, and you're on a
+# known distraction -> chime + stamp the signal file (the deck flashes on the stamp).
+$focusTimer = New-Object System.Windows.Forms.Timer
+$focusTimer.Interval = 20000
+$focusTimer.Add_Tick({
+  if (-not (Test-Path $focusFlag)) { return }
+  if (Test-Path $dndFlag) { return }
+  if (([Environment]::TickCount - $script:lastNudge) -lt $NUDGE_GAP_MS) { return }
+  if (Any-SessionActive) { return }
+  $info = Get-PomoCategory
+  if ($info.cat -ne 'distract') { return }
+  $script:lastNudge = [Environment]::TickCount
+  try { Set-Content -LiteralPath $nudgeSignal -Value $script:lastNudge -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+  Play-PomoChime
+  # If the deck is closed there'd be nothing to shake you - pop it so the Matrix
+  # animation can play. The deck reads the (just-written) stamp on startup and, if
+  # it's fresh, runs the gag immediately. If the deck is already open we leave it
+  # be (its own poll plays the animation) so we don't yank focus needlessly.
+  try {
+    $deckOpen = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.CommandLine -like '*session-view.ps1*' }).Count -gt 0
+    if (-not $deckOpen) {
+      $vbs = Join-Path $env:USERPROFILE '.claude\sessions\show-view.vbs'
+      Start-Process wscript.exe -ArgumentList ('"{0}"' -f $vbs) -ErrorAction SilentlyContinue
+    }
+  } catch {}
+})
+$focusTimer.Start()
 
 $hk = New-Object HotKeyWindow
 $hk.add_Pressed({

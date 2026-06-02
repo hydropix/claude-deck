@@ -76,6 +76,15 @@ public class WinFocus {
     POINT p; if (!GetCursorPos(out p)) return false;
     return (p.X < l || p.X > r || p.Y < t || p.Y > b);
   }
+  // Standard taskbar attention flash (used by the focus nudge).
+  [DllImport("user32.dll")] static extern bool FlashWindowEx(ref FLASHWINFO p);
+  [StructLayout(LayoutKind.Sequential)] struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
+  public static void Flash(IntPtr h, uint count) {
+    FLASHWINFO fi = new FLASHWINFO();
+    fi.cbSize = (uint)Marshal.SizeOf(fi);
+    fi.hwnd = h; fi.dwFlags = 3 /* FLASHW_ALL */; fi.uCount = count; fi.dwTimeout = 0;
+    FlashWindowEx(ref fi);
+  }
 }
 
 // Documented virtual-desktop API (stable across Windows updates).
@@ -136,7 +145,10 @@ if (-not $mutexCreated) {
 $stateDir    = Join-Path $env:USERPROFILE '.claude\sessions\state'
 $closeFlag   = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'   # opt-in: close on outside click
 $dndFlag     = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'            # suspend auto-popup on completion
-$posFile     = Join-Path $env:USERPROFILE '.claude\sessions\position.txt'        # top | bottom
+$focusFlag   = Join-Path $env:USERPROFILE '.claude\sessions\focus.flag'          # opt-in: nudge me back when Claude is idle and I'm distracted
+$posFile     = Join-Path $env:USERPROFILE '.claude\sessions\position.txt'        # top | bottom | free
+$posXFile    = Join-Path $env:USERPROFILE '.claude\sessions\posx.txt'            # custom left (px); present = user dragged a horizontal spot
+$posYFile    = Join-Path $env:USERPROFILE '.claude\sessions\posy.txt'            # custom top (px); used only when position = free
 $opacityFile = Join-Path $env:USERPROFILE '.claude\sessions\opacity.txt'         # 20..100 (window opacity %)
 $sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'            # 30..95 (overall scale; 55 = Normal/1.0, drives width + fonts)
 
@@ -151,6 +163,22 @@ $statsVbs    = Join-Path $env:USERPROFILE '.claude\sessions\show-stats.vbs'
 # header just renders it and drops control tokens into pomodoro-cmd.txt.
 $pomoState   = Join-Path $env:USERPROFILE '.claude\sessions\pomodoro.json'
 $pomoCmd     = Join-Path $env:USERPROFILE '.claude\sessions\pomodoro-cmd.txt'
+
+# Focus nudge: the tray stamps a tick count into focus-nudge.txt on each nudge.
+# We poll it on the 1s Pomodoro timer and play the animation when the stamp is fresh.
+# At startup: a STALE stamp is seeded into lastNudgeSeen (so opening the deck later
+# never replays an old nudge), but a FRESH one is left unseen - that's the case where
+# the tray popped the deck open *for* this nudge, so the first poll should play it.
+$nudgeFile   = Join-Path $env:USERPROFILE '.claude\sessions\focus-nudge.txt'
+$script:lastNudgeSeen = $null
+try {
+  if (Test-Path $nudgeFile) {
+    $nv = ([System.IO.File]::ReadAllText($nudgeFile)).Trim()
+    $nAge = 999999
+    try { $nAge = [Environment]::TickCount - [int]$nv } catch {}
+    if (-not ($nAge -ge 0 -and $nAge -lt 12000)) { $script:lastNudgeSeen = $nv }
+  }
+} catch {}
 
 function Get-LocalVersion {
   try { if (Test-Path $verFile) { return ([System.IO.File]::ReadAllText($verFile)).Trim() } } catch {}
@@ -262,18 +290,40 @@ function New-MatIcon([int]$matCode, [int]$fallback, [single]$px, $color, [single
 
 # Preferences (position + opacity + size) are re-read on every refresh so changes
 # from the tray menu apply live without reopening the view.
-$script:position = 'top'
+$script:position   = 'top'
+$script:customLeft = $null       # custom horizontal left (px); $null = centered
+$script:customTop  = $null       # custom top (px); used only when position = free
 $script:opacity  = 0.92          # default: light transparency (Light)
 $script:widthPct = 48            # default size = Normal (% of screen width)
 function Read-Prefs {
   $script:position = 'top'
-  try { if (Test-Path $posFile) { $p = (Get-Content $posFile -Raw -ErrorAction Stop).Trim().ToLower(); if ($p -in @('top','bottom')) { $script:position = $p } } } catch {}
+  try { if (Test-Path $posFile) { $p = (Get-Content $posFile -Raw -ErrorAction Stop).Trim().ToLower(); if ($p -in @('top','bottom','free')) { $script:position = $p } } } catch {}
+  $script:customLeft = $null
+  try { if (Test-Path $posXFile) { $script:customLeft = [int]((Get-Content $posXFile -Raw -ErrorAction Stop).Trim()) } } catch {}
+  $script:customTop = $null
+  try { if (Test-Path $posYFile) { $script:customTop = [int]((Get-Content $posYFile -Raw -ErrorAction Stop).Trim()) } } catch {}
   $script:opacity = 0.92         # default: light transparency (Light)
   try { if (Test-Path $opacityFile) { $v = [int]((Get-Content $opacityFile -Raw -ErrorAction Stop).Trim()); if ($v -ge 20 -and $v -le 100) { $script:opacity = $v / 100.0 } } } catch {}
   $script:widthPct = 48          # default size = Normal
   try { if (Test-Path $sizeFile) { $w = [int]((Get-Content $sizeFile -Raw -ErrorAction Stop).Trim()); if ($w -ge 30 -and $w -le 95) { $script:widthPct = $w } } } catch {}
 }
+
+# A dragged spot (including another monitor) is remembered only while this view
+# stays open. On a fresh launch we come back to the primary screen: drop the custom
+# placement and clear its files. The top/bottom anchor is a real preference and is
+# kept (a leftover 'free' state collapses back to the default 'top').
+function Reset-LaunchPosition {
+  if ($script:position -eq 'free') {
+    $script:position = 'top'
+    try { Set-Content -LiteralPath $posFile -Value 'top' -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+  }
+  $script:customLeft = $null
+  $script:customTop  = $null
+  try { Remove-Item -LiteralPath $posXFile -Force -ErrorAction SilentlyContinue } catch {}
+  try { Remove-Item -LiteralPath $posYFile -Force -ErrorAction SilentlyContinue } catch {}
+}
 Read-Prefs
+Reset-LaunchPosition   # fresh launch always starts on the primary screen
 
 # --- Sizing relative to the primary screen (looks right at any resolution) ---
 # The Size preference scales the WHOLE view homothetically: not just the window
@@ -305,14 +355,51 @@ function Compute-Dims {
 Compute-Dims
 $script:appliedWidthPct = $script:widthPct   # tracks the size currently rendered
 
-# Vertical placement for a window of height $h, per the chosen position.
+# The monitor the deck currently lives on. When the user has dragged a custom
+# horizontal spot we resolve the screen under that point (so the deck can live on
+# ANY monitor, and top/bottom anchor to THAT monitor); otherwise we default to the
+# primary screen. $screen (primary) is still used as the sizing reference.
+function Get-ActiveScreen {
+  try {
+    if ($null -ne $script:customLeft) {
+      $cx = [int]$script:customLeft + [int]($script:formW / 2)
+      $cy = if ($null -ne $script:customTop) { [int]$script:customTop } else { [int]$screen.Y }
+      return [System.Windows.Forms.Screen]::FromPoint((New-Object System.Drawing.Point($cx, $cy))).WorkingArea
+    }
+  } catch {}
+  return $screen
+}
+
+# Vertical placement for a window of height $h, per the chosen position, on the
+# deck's current monitor. In 'free' mode (the user dragged the deck) we honour the
+# saved custom top, clamped to the whole virtual desktop so it can sit on another
+# monitor yet never end up fully off-screen.
 function Get-FormTop($h) {
-  $margin = [int][math]::Max(24, $screen.Height * 0.04)
+  $sc = Get-ActiveScreen
+  $margin = [int][math]::Max(24, $sc.Height * 0.04)
   switch ($script:position) {
-    'top'    { return [int]($screen.Y + $margin) }
-    'bottom' { return [int]($screen.Y + $screen.Height - $h - $margin) }
-    default  { return [int]($screen.Y + ($screen.Height - $h) / 2) }
+    'top'    { return [int]($sc.Y + $margin) }
+    'bottom' { return [int]($sc.Y + $sc.Height - $h - $margin) }
+    'free'   {
+      $t  = if ($null -ne $script:customTop) { $script:customTop } else { [int]($sc.Y + ($sc.Height - $h) / 2) }
+      $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+      return [int][math]::Max($vs.Y, [math]::Min($t, $vs.Y + $vs.Height - $h))
+    }
+    default  { return [int]($sc.Y + ($sc.Height - $h) / 2) }
   }
+}
+
+# Horizontal placement for a window of width $w: the saved custom left when the
+# user has dragged one (clamped to the whole virtual desktop, so another monitor
+# is allowed), otherwise centered on the current monitor. Kept independently of the
+# vertical position, so snapping top/bottom preserves a custom horizontal spot.
+function Get-FormLeft($w) {
+  if ($null -ne $script:customLeft) {
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    return [int][math]::Max($vs.X, [math]::Min($script:customLeft, $vs.X + $vs.Width - $w))
+  }
+  $sc = Get-ActiveScreen
+  return [int]($sc.X + ($sc.Width - $w) / 2)
 }
 
 $bg     = [System.Drawing.Color]::FromArgb(24, 24, 28)
@@ -416,7 +503,7 @@ $form = New-Object System.Windows.Forms.Form
 $form.FormBorderStyle = 'None'
 $form.StartPosition   = 'Manual'   # pin to the PRIMARY screen (with the taskbar), not the 2nd monitor
 $form.Size            = New-Object System.Drawing.Size($formW, $formH)
-$formLeft = [int]($screen.X + ($screen.Width - $formW) / 2)
+$formLeft = Get-FormLeft $formW
 $form.Location        = New-Object System.Drawing.Point($formLeft, (Get-FormTop $formH))
 $form.BackColor       = $bg
 $form.Opacity         = $script:opacity
@@ -629,6 +716,12 @@ function Build-SettingsMenu {
   $co.Add_Click({ Toggle-Flag $closeFlag })
   [void]$m.Items.Add($co)
 
+  $fn = New-Object System.Windows.Forms.ToolStripMenuItem('Focus nudge')
+  $fn.Checked = (Test-Path $focusFlag)
+  $fn.ToolTipText = "When no session is running and you drift to a distracting app, Claude nudges you back with a sound + popup (off by default)"
+  $fn.Add_Click({ Toggle-Flag $focusFlag })
+  [void]$m.Items.Add($fn)
+
   # Transparency submenu — writes opacity % (re-read live on the next refresh).
   $curOp = [int]([math]::Round($script:opacity * 100))
   $opMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Transparency')
@@ -754,6 +847,52 @@ foreach ($pb in @($script:posTop, $script:posBot)) {
 }
 Update-PosHighlight
 
+# --- Drag the deck anywhere on screen --------------------------------------
+# Click-and-drag on empty header space (or the title) moves the whole window.
+# On release we persist the new spot: posx.txt always (the custom horizontal,
+# kept even when you later snap top/bottom) and posy.txt + position='free' for
+# the vertical (overridden the moment you click the top/bottom buttons). The
+# refresh timer skips repositioning while a drag is in progress (see Refresh-List).
+$script:dragging   = $false
+$script:dragOrigin = $null    # cursor screen position when the drag began
+$script:dragStart  = $null    # window location when the drag began
+$header.Cursor = [System.Windows.Forms.Cursors]::SizeAll
+function Save-CustomPosition {
+  $script:customLeft = $form.Left
+  $script:customTop  = $form.Top
+  $script:position   = 'free'
+  try {
+    Set-Content -LiteralPath $posXFile -Value $form.Left -Encoding ASCII -ErrorAction SilentlyContinue
+    Set-Content -LiteralPath $posYFile -Value $form.Top  -Encoding ASCII -ErrorAction SilentlyContinue
+    Set-Content -LiteralPath $posFile  -Value 'free'     -Encoding ASCII -ErrorAction SilentlyContinue
+  } catch {}
+  Update-PosHighlight
+}
+function Start-Drag {
+  $script:dragging   = $true
+  $script:dragOrigin = [System.Windows.Forms.Cursor]::Position
+  $script:dragStart  = $form.Location
+}
+function Do-Drag {
+  if (-not $script:dragging) { return }
+  $cur = [System.Windows.Forms.Cursor]::Position
+  $nx  = $script:dragStart.X + ($cur.X - $script:dragOrigin.X)
+  $ny  = $script:dragStart.Y + ($cur.Y - $script:dragOrigin.Y)
+  $form.Location = New-Object System.Drawing.Point([int]$nx, [int]$ny)
+}
+function End-Drag {
+  if (-not $script:dragging) { return }
+  $script:dragging = $false
+  # Only persist if it actually moved — a bare click shouldn't switch to 'free'.
+  $moved = ([math]::Abs($form.Left - $script:dragStart.X) -gt 3) -or ([math]::Abs($form.Top - $script:dragStart.Y) -gt 3)
+  if ($moved) { Save-CustomPosition }
+}
+foreach ($dragSurface in @($header, $title)) {
+  $dragSurface.Add_MouseDown({ param($snd, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Start-Drag } })
+  $dragSurface.Add_MouseMove({ param($snd, $e) Do-Drag })
+  $dragSurface.Add_MouseUp({   param($snd, $e) End-Drag })
+}
+
 $hint = New-Object System.Windows.Forms.Label
 $hint.Text = ''
 $hint.ForeColor = $grey
@@ -813,6 +952,100 @@ $list.BringToFront()
 
 # Tooltip shared by every row's ✕ (hide) button.
 $script:rowTip = New-Object System.Windows.Forms.ToolTip
+
+# Resolve a session's git remote to a browsable web URL (or $null). We read
+# .git/config directly rather than spawning git.exe — no console flash, no PATH
+# dependency — walking up from the session's cwd so a sub-directory still resolves,
+# and following the "gitdir:" pointer when .git is a file (worktrees / submodules).
+# git@host:user/repo.git and ssh://git@host/user/repo.git are normalised to https.
+function Get-RepoWebUrl([string]$cwd) {
+  try {
+    if (-not $cwd) { return $null }
+    $dir = $cwd; $gitPath = $null
+    for ($i = 0; $i -lt 8 -and $dir; $i++) {
+      $cand = Join-Path $dir '.git'
+      if (Test-Path $cand) { $gitPath = $cand; break }
+      $parent = Split-Path $dir -Parent
+      if (-not $parent -or $parent -eq $dir) { break }
+      $dir = $parent
+    }
+    if (-not $gitPath) { return $null }
+    # .git is a directory in a normal clone, a file ("gitdir: <path>") in a worktree.
+    if (Test-Path $gitPath -PathType Container) {
+      $configPath = Join-Path $gitPath 'config'
+    } else {
+      $first = (Get-Content -LiteralPath $gitPath -TotalCount 1 -ErrorAction Stop)
+      if ($first -notmatch '^gitdir:\s*(.+)$') { return $null }
+      $gd = $Matches[1].Trim()
+      if (-not [System.IO.Path]::IsPathRooted($gd)) { $gd = Join-Path $dir $gd }
+      $configPath = Join-Path $gd 'config'
+      if (-not (Test-Path $configPath)) {                          # worktree: config lives in the common dir
+        $commondir = Join-Path $gd 'commondir'
+        if (Test-Path $commondir) {
+          $cd = ((Get-Content -LiteralPath $commondir -TotalCount 1).Trim())
+          if (-not [System.IO.Path]::IsPathRooted($cd)) { $cd = Join-Path $gd $cd }
+          $configPath = Join-Path $cd 'config'
+        }
+      }
+    }
+    if (-not (Test-Path $configPath)) { return $null }
+    $cfg = [System.IO.File]::ReadAllText($configPath)
+    # Prefer origin's url; fall back to the first remote url in the file.
+    $url = $null
+    $m = [regex]::Match($cfg, '(?ms)^\[remote "origin"\](.*?)(?=^\[|\Z)')
+    if ($m.Success) {
+      $um = [regex]::Match($m.Groups[1].Value, '(?m)^\s*url\s*=\s*(.+?)\s*$')
+      if ($um.Success) { $url = $um.Groups[1].Value.Trim() }
+    }
+    if (-not $url) {
+      $um = [regex]::Match($cfg, '(?m)^\s*url\s*=\s*(.+?)\s*$')
+      if ($um.Success) { $url = $um.Groups[1].Value.Trim() }
+    }
+    if (-not $url) { return $null }
+    $web = $url
+    if     ($web -match '^git@([^:]+):(.+)$')        { $web = 'https://{0}/{1}' -f $Matches[1], $Matches[2] }
+    elseif ($web -match '^ssh://git@([^/]+)/(.+)$')  { $web = 'https://{0}/{1}' -f $Matches[1], $Matches[2] }
+    $web = $web -replace '\.git/?$', ''
+    if ($web -match '^https?://') { return $web }
+    return $null
+  } catch { return $null }
+}
+
+# A menu label for a known forge, or a generic one for any other https remote.
+function Get-RepoMenuLabel([string]$url) {
+  if ($url -match 'github\.com')    { return 'Open on GitHub' }
+  if ($url -match 'gitlab\.com')    { return 'Open on GitLab' }
+  if ($url -match 'bitbucket\.org') { return 'Open on Bitbucket' }
+  return 'Open repository in browser'
+}
+
+# Host-aware deep links (issues / changes / CI) under a repo web URL. Empty for an
+# unknown forge — the menu then shows only the repo home entry.
+function Get-RepoSubLinks([string]$url) {
+  if ($url -match 'github\.com') {
+    return @(@{ label = 'Issues'; url = "$url/issues" },
+             @{ label = 'Pull requests'; url = "$url/pulls" },
+             @{ label = 'Actions'; url = "$url/actions" })
+  }
+  if ($url -match 'gitlab\.com') {
+    return @(@{ label = 'Issues'; url = "$url/-/issues" },
+             @{ label = 'Merge requests'; url = "$url/-/merge_requests" },
+             @{ label = 'Pipelines'; url = "$url/-/pipelines" })
+  }
+  if ($url -match 'bitbucket\.org') {
+    return @(@{ label = 'Issues'; url = "$url/issues" },
+             @{ label = 'Pull requests'; url = "$url/pull-requests" },
+             @{ label = 'Pipelines'; url = "$url/pipelines" })
+  }
+  return @()
+}
+
+# Open a terminal at $cwd: prefer Windows Terminal, fall back to PowerShell.
+function Open-Terminal([string]$cwd) {
+  if (-not $cwd -or -not (Test-Path -LiteralPath $cwd)) { return }
+  try { Start-Process wt.exe -ArgumentList ('-d "{0}"' -f $cwd) -ErrorAction Stop }
+  catch { Start-Process powershell.exe -WorkingDirectory $cwd -ErrorAction SilentlyContinue }
+}
 
 function Make-Row($s, $status, $seen, $promptText, $age) {
   $btn = New-Object System.Windows.Forms.Button
@@ -931,6 +1164,47 @@ function Make-Row($s, $status, $seen, $promptText, $age) {
   if ($ctxLbl) { $ctxLbl.Add_Click($clickHandler) }   # the ctx slot is part of the clickable row
   # ✕ dismisses the session and refreshes immediately (don't focus the IDE).
   $closeLbl.Add_Click({ Set-Dismissed $sid; $script:lastSig = $null; Refresh-List }.GetNewClosure())
+
+  # Right-click anywhere on the row -> open the project folder / a terminal, plus
+  # the repo home and its issues / PRs / CI pages when there's a git remote. All
+  # resolved lazily on Opening so we don't touch the filesystem for every row on
+  # every refresh; remote-only entries are hidden when there's no remote, and the
+  # whole menu is suppressed when nothing applies. The three deep links are reused
+  # slots (text/url set on open) so one menu serves GitHub, GitLab or Bitbucket.
+  $cmRow      = New-Object System.Windows.Forms.ContextMenuStrip
+  $folderItem = New-Object System.Windows.Forms.ToolStripMenuItem('Open folder')
+  $termItem   = New-Object System.Windows.Forms.ToolStripMenuItem('Open in terminal')
+  $sep1       = New-Object System.Windows.Forms.ToolStripSeparator
+  $openItem   = New-Object System.Windows.Forms.ToolStripMenuItem('Open repository in browser')
+  $sub1 = New-Object System.Windows.Forms.ToolStripMenuItem('')
+  $sub2 = New-Object System.Windows.Forms.ToolStripMenuItem('')
+  $sub3 = New-Object System.Windows.Forms.ToolStripMenuItem('')
+  $subItems = @($sub1, $sub2, $sub3)
+  foreach ($it in @($folderItem, $termItem, $sep1, $openItem, $sub1, $sub2, $sub3)) { [void]$cmRow.Items.Add($it) }
+  $cmRow.Add_Opening({
+    param($snd, $e)
+    $hasFolder = ($cwd -and (Test-Path -LiteralPath $cwd))
+    $folderItem.Visible = $hasFolder
+    $termItem.Visible   = $hasFolder
+    $u = Get-RepoWebUrl $cwd
+    if ($u) { $openItem.Visible = $true; $openItem.Text = Get-RepoMenuLabel $u; $openItem.Tag = $u }
+    else    { $openItem.Visible = $false }
+    $subs = if ($u) { @(Get-RepoSubLinks $u) } else { @() }
+    for ($k = 0; $k -lt $subItems.Count; $k++) {
+      if ($k -lt $subs.Count) { $subItems[$k].Visible = $true; $subItems[$k].Text = '      ' + $subs[$k].label; $subItems[$k].Tag = $subs[$k].url }
+      else { $subItems[$k].Visible = $false }
+    }
+    $sep1.Visible = ($hasFolder -and $u)
+    if (-not $hasFolder -and -not $u) { $e.Cancel = $true }
+  }.GetNewClosure())
+  $folderItem.Add_Click({ if ($cwd) { Start-Process explorer.exe -ArgumentList ('"{0}"' -f $cwd) -ErrorAction SilentlyContinue } }.GetNewClosure())
+  $termItem.Add_Click({ Open-Terminal $cwd }.GetNewClosure())
+  $openItem.Add_Click({ if ($openItem.Tag) { Start-Process ([string]$openItem.Tag) -ErrorAction SilentlyContinue } }.GetNewClosure())
+  foreach ($si in @($sub1, $sub2, $sub3)) { $si.Add_Click({ if ($this.Tag) { Start-Process ([string]$this.Tag) -ErrorAction SilentlyContinue } }) }
+  $btn.ContextMenuStrip      = $cmRow
+  $statLbl.ContextMenuStrip  = $cmRow
+  $closeLbl.ContextMenuStrip = $cmRow
+  if ($ctxLbl) { $ctxLbl.ContextMenuStrip = $cmRow }
   return $btn
 }
 
@@ -1002,13 +1276,19 @@ function Refresh-List {
     $script:appliedWidthPct = $script:widthPct
     Compute-Dims                        # rescale fonts/badges/paddings + width together
     Restyle                             # re-font the header to the new scale
-    $script:formLeft = [int]($screen.X + ($screen.Width - $script:formW) / 2)
+    $script:formLeft = Get-FormLeft $script:formW
     $form.Width      = $script:formW
     $form.Left       = $script:formLeft
     $script:lastSig  = $null            # force a row rebuild so rows re-font + reflow
   }
-  $wantTop = Get-FormTop $form.Height
-  if ($form.Top -ne $wantTop) { $form.Top = $wantTop }
+  # Re-apply the preferred placement live (top/bottom snap, or the dragged custom
+  # spot) — but never fight an in-progress drag.
+  if (-not $script:dragging) {
+    $wantLeft = Get-FormLeft $form.Width
+    if ($form.Left -ne $wantLeft) { $form.Left = $wantLeft }
+    $wantTop = Get-FormTop $form.Height
+    if ($form.Top -ne $wantTop) { $form.Top = $wantTop }
+  }
 
   $now = Get-Date
   $sessions = @()
@@ -1088,12 +1368,15 @@ function Refresh-List {
   $desired = $headerH + $listPadV + ($count * ($rowH + $rowMargin)) + 6
   $maxH    = [int]($screen.Height * 0.9)
   $minH    = $headerH + $listPadV + ($rowH + $rowMargin) + 6
-  $newH    = [math]::Min($maxH, [math]::Max($minH, $desired))
-  $wantTop = Get-FormTop $newH
-  if ($form.Height -ne $newH -or $form.Left -ne $formLeft -or $form.Top -ne $wantTop) {
+  $newH     = [math]::Min($maxH, [math]::Max($minH, $desired))
+  $wantTop  = Get-FormTop $newH
+  $wantLeft = Get-FormLeft $form.Width
+  if ($form.Height -ne $newH -or $form.Left -ne $wantLeft -or $form.Top -ne $wantTop) {
     $form.Height = $newH
-    $form.Left   = $formLeft   # keep it on the primary screen, horizontally centered
-    $form.Top    = $wantTop    # top / center / bottom per the chosen position
+    if (-not $script:dragging) {
+      $form.Left = $wantLeft   # custom dragged spot, else horizontally centered
+      $form.Top  = $wantTop    # top / center / bottom / dragged per the chosen position
+    }
   }
 
   # Drive animations: running rows spin; waiting rows breathe; a NEW completion flashes once.
@@ -1109,15 +1392,169 @@ function Refresh-List {
   if (@($script:spinLbls).Count -gt 0) { $spinTimer.Start() }
 }
 
+# --- Focus-nudge "Matrix" animation -------------------------------------------
+# When the tray fires a focus nudge it stamps focus-nudge.txt. Instead of a plain
+# flash we run a short green digital-rain gag over the deck with an ASCII Claude
+# mascot + a wink line ("Wake up... let's code"), ~2s then fade. Only shows if the
+# deck is open; the taskbar FlashWindowEx still fires regardless.
+$script:fxCW       = 16     # rain cell width (px)
+$script:fxCH       = 18     # rain cell height (px)
+$script:fxTrailLen = 11     # glyphs per falling column
+$script:fxMaxFrames = 34    # ~34 * 60ms ~= 2s
+$script:fxActive   = $false
+$script:fxFrame    = 0
+$script:fxAlpha    = 1.0
+$script:fxHeads    = @()
+$script:fxSpeed    = @()
+$script:fxLine     = ''
+# ASCII glyphs (ASCII only, so any monospace font renders them - no tofu boxes).
+$script:fxGlyphs = ('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$+*<>=/\|?!#%&{}[]'.ToCharArray())
+# Green ASCII Claude mascot (the '*' up top nods to the Claude Code sparkle).
+$script:fxArt = @(
+  '    .  *  .    ',
+  '   ._______.   ',
+  '   | o   o |   ',
+  '   |   _   |   ',
+  '   |  (_)  |   ',
+  '   |_______|   ',
+  '    || | ||    ')
+$script:fxLines = @(
+  "Wake up... the code won't write itself.",
+  "Follow the white rabbit -> your TODOs.",
+  "There is no spoon. Only un-merged branches.",
+  "Knock knock. Claude wants to build.",
+  "I know kung-fu. And also your codebase.",
+  "Come back to the Matrix. Bring coffee.")
+
+$script:fxFont      = New-Object System.Drawing.Font('Consolas', 13)
+$script:fxArtFont   = New-Object System.Drawing.Font('Consolas', 15, [System.Drawing.FontStyle]::Bold)
+$script:fxHeadBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(205, 255, 205))
+$script:fxArtBrush  = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(150, 255, 170))
+$script:fxLineBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(120, 255, 140))
+$script:fxTrail     = New-Object 'System.Drawing.SolidBrush[]' $script:fxTrailLen
+for ($t = 0; $t -lt $script:fxTrailLen; $t++) {
+  $gv = [int][math]::Max(60, 255 - $t * 20)
+  $script:fxTrail[$t] = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(25, $gv, 60))
+}
+
+# Full-deck overlay panel the rain is painted onto (hidden until a nudge).
+$fx = New-Object System.Windows.Forms.Panel
+$fx.BackColor = [System.Drawing.Color]::Black
+$fx.Visible = $false
+$dbProp.SetValue($fx, $true, $null)   # double-buffer (same trick as the form)
+$fx.Add_Click({ $script:fxFrame = $script:fxMaxFrames })   # click anywhere to dismiss early
+$fx.Add_Paint({
+  param($snd, $e)
+  $g = $e.Graphics
+  $g.Clear([System.Drawing.Color]::Black)
+  $w = $fx.ClientSize.Width; $h = $fx.ClientSize.Height
+  $cw = $script:fxCW; $ch = $script:fxCH; $tl = $script:fxTrailLen
+  $gn = $script:fxGlyphs.Length
+  $cols = $script:fxHeads.Length
+  for ($c = 0; $c -lt $cols; $c++) {
+    $x = $c * $cw
+    $head = $script:fxHeads[$c]
+    for ($t = 0; $t -lt $tl; $t++) {
+      $y = $head - $t * $ch
+      if ($y -lt (-$ch) -or $y -gt $h) { continue }
+      $row = [int][math]::Floor($y / $ch)
+      $idx = [math]::Abs(($c * 131 + $row * 17 + ($script:fxFrame -shr 1) * 5)) % $gn
+      $brush = if ($t -eq 0) { $script:fxHeadBrush } else { $script:fxTrail[$t] }
+      $g.DrawString([string]$script:fxGlyphs[$idx], $script:fxFont, $brush, [single]$x, [single]$y)
+    }
+  }
+  # Centered mascot + wink line, on a dark backdrop for readability.
+  $sf = New-Object System.Drawing.StringFormat
+  $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
+  $artText = ($script:fxArt -join "`n")
+  $artSize = $g.MeasureString($artText, $script:fxArtFont)
+  $lineSize = $g.MeasureString($script:fxLine, $script:fxFont)
+  $blockW = [math]::Max($artSize.Width, $lineSize.Width)
+  $blockH = $artSize.Height + 10 + $lineSize.Height
+  $top = [single](($h - $blockH) / 2)
+  $pad = 18
+  $veil = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(160, 0, 0, 0))
+  $g.FillRectangle($veil, [single](($w - $blockW) / 2 - $pad), [single]($top - $pad), [single]($blockW + 2 * $pad), [single]($blockH + 2 * $pad))
+  $veil.Dispose()
+  $g.DrawString($artText, $script:fxArtFont, $script:fxArtBrush, (New-Object System.Drawing.RectangleF(0, $top, $w, $artSize.Height)), $sf)
+  $g.DrawString($script:fxLine, $script:fxFont, $script:fxLineBrush, (New-Object System.Drawing.RectangleF(0, ($top + $artSize.Height + 10), $w, $lineSize.Height)), $sf)
+  # Fade-out veil over the whole frame.
+  if ($script:fxAlpha -lt 1.0) {
+    $a = [int]((1.0 - $script:fxAlpha) * 255)
+    $fb = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($a, 0, 0, 0))
+    $g.FillRectangle($fb, 0, 0, $w, $h); $fb.Dispose()
+  }
+})
+$form.Controls.Add($fx)
+
+# Seed the falling columns for the current overlay width.
+function Fx-Init {
+  $cols = [int][math]::Max(1, [math]::Floor($fx.ClientSize.Width / $script:fxCW))
+  $script:fxHeads = New-Object 'double[]' $cols
+  $script:fxSpeed = New-Object 'double[]' $cols
+  for ($i = 0; $i -lt $cols; $i++) {
+    $script:fxHeads[$i] = [double](-(Get-Random -Minimum 0 -Maximum ([math]::Max(1, $fx.ClientSize.Height))))
+    $script:fxSpeed[$i] = [double](Get-Random -Minimum 8 -Maximum 26)
+  }
+}
+
+$fxTimer = New-Object System.Windows.Forms.Timer
+$fxTimer.Interval = 60
+$fxTimer.Add_Tick({
+  $script:fxFrame++
+  $h = $fx.ClientSize.Height
+  for ($i = 0; $i -lt $script:fxHeads.Length; $i++) {
+    $script:fxHeads[$i] += $script:fxSpeed[$i]
+    if (($script:fxHeads[$i] - $script:fxTrailLen * $script:fxCH) -gt $h) {
+      $script:fxHeads[$i] = [double](-(Get-Random -Minimum 0 -Maximum 200))
+      $script:fxSpeed[$i] = [double](Get-Random -Minimum 8 -Maximum 26)
+    }
+  }
+  $fadeStart = $script:fxMaxFrames - 8
+  if ($script:fxFrame -ge $fadeStart) { $script:fxAlpha = [math]::Max(0.0, 1.0 - (($script:fxFrame - $fadeStart) / 8.0)) }
+  if ($script:fxFrame -ge $script:fxMaxFrames) {
+    $fxTimer.Stop(); $script:fxActive = $false; $fx.Visible = $false
+    try { $form.Refresh() } catch {}
+    return
+  }
+  $fx.Invalidate()
+})
+
+function Flash-Deck {
+  try { [WinFocus]::Flash($form.Handle, 4) } catch {}
+  if ($script:fxActive) { return }
+  $script:fxLine  = $script:fxLines | Get-Random
+  $script:fxFrame = 0
+  $script:fxAlpha = 1.0
+  $fx.Bounds = $form.ClientRectangle
+  Fx-Init
+  $fx.Visible = $true
+  $fx.BringToFront()
+  $script:fxActive = $true
+  $fxTimer.Start()
+}
+# Detect a fresh nudge stamp (< 15s old) and flash once per stamp.
+function Check-FocusNudge {
+  if (-not (Test-Path $nudgeFile)) { return }
+  $val = $null
+  try { $val = ([System.IO.File]::ReadAllText($nudgeFile)).Trim() } catch {}
+  if (-not $val -or $val -eq $script:lastNudgeSeen) { return }
+  $script:lastNudgeSeen = $val
+  $age = 999999
+  try { $age = [Environment]::TickCount - [int]$val } catch {}
+  if ($age -ge 0 -and $age -lt 15000) { Flash-Deck }
+}
+
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 2000
 $timer.Add_Tick({ Refresh-List })
 $timer.Start()
 
-# Pomodoro display refresh (1s, so the clock ticks smoothly in the header).
+# Pomodoro display refresh (1s, so the clock ticks smoothly in the header). We also
+# piggyback the focus-nudge poll here - same 1s cadence, no extra timer.
 $pomoTimer = New-Object System.Windows.Forms.Timer
 $pomoTimer.Interval = 1000
-$pomoTimer.Add_Tick({ Read-PomoState; Render-Pomo })
+$pomoTimer.Add_Tick({ Read-PomoState; Render-Pomo; Check-FocusNudge })
 $pomoTimer.Start()
 
 # Follow the user across virtual desktops (feels pinned to all desktops).
@@ -1148,7 +1585,7 @@ $clickTimer.Add_Tick({
 $clickTimer.Start()
 
 $form.Add_FormClosed({
-  $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop(); $spinTimer.Stop(); $pomoTimer.Stop(); $pomoPulse.Stop()
+  $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop(); $spinTimer.Stop(); $pomoTimer.Stop(); $pomoPulse.Stop(); $fxTimer.Stop()
   # Release the single-instance mutex immediately so the next finished task can
   # pop a fresh view without racing this process's shutdown.
   try { $script:viewMutex.ReleaseMutex() } catch {}

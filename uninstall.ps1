@@ -17,7 +17,7 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
 $startup = [Environment]::GetFolderPath('Startup')
 $desktop = [Environment]::GetFolderPath('Desktop')
 Remove-Item (Join-Path $startup 'ClaudeDeck Tray.lnk')    -Force -ErrorAction SilentlyContinue
-Remove-Item (Join-Path $desktop 'ClaudeDeck (grand).lnk') -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $desktop 'ClaudeDeck (Large).lnk') -Force -ErrorAction SilentlyContinue
 
 # --- 3) Strip ClaudeDeck hooks from settings.json --------------------------
 function ConvertTo-HashtableDeep($o) {

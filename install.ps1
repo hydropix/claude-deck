@@ -60,7 +60,7 @@ $trackerPrompt = '& "$env:USERPROFILE\.claude\sessions\session-tracker.ps1" -Eve
 $trackerStop   = '& "$env:USERPROFILE\.claude\sessions\session-tracker.ps1" -Event stop'
 $trackerEnd    = '& "$env:USERPROFILE\.claude\sessions\session-tracker.ps1" -Event end'
 $trackerNotify = '& "$env:USERPROFILE\.claude\sessions\session-tracker.ps1" -Event notify'
-# The large view auto-opens on Stop, unless "Ne pas deranger" (dnd.flag) is set.
+# The large view auto-opens on Stop, unless "Do not disturb" (dnd.flag) is set.
 $viewStop = (@'
 if (-not (Test-Path "$env:USERPROFILE\.claude\sessions\dnd.flag")) { Start-Process wscript.exe -ArgumentList ('"' + (Join-Path $env:USERPROFILE '.claude\sessions\show-view.vbs') + '"') }
 '@).Trim()
@@ -100,7 +100,7 @@ $lnk.Description       = 'ClaudeDeck tray'
 $lnk.Save()
 
 $desktop = [Environment]::GetFolderPath('Desktop')
-$lnk2 = $ws.CreateShortcut((Join-Path $desktop 'ClaudeDeck (grand).lnk'))
+$lnk2 = $ws.CreateShortcut((Join-Path $desktop 'ClaudeDeck (Large).lnk'))
 $lnk2.TargetPath       = 'wscript.exe'
 $lnk2.Arguments        = '"' + (Join-Path $dest 'show-view.vbs') + '"'
 $lnk2.WorkingDirectory = $dest

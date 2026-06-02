@@ -113,19 +113,25 @@ public class VDesk {
 }
 "@
 
-# Single-instance: if a view window is already open, pull it onto THIS desktop
-# (so it never yanks you to another desktop) and focus it, then exit.
-$WindowTitle = 'Sessions Claude Code'
-$existing = [WinFocus]::FindExact($WindowTitle)
-if ($existing -ne [System.IntPtr]::Zero) {
-  [VDesk]::FollowToCurrentDesktop($existing)
-  [WinFocus]::RaiseWindow($existing)
+$WindowTitle = 'Claude Code Sessions'
+
+# Single-instance via a named mutex. Exactly one view is alive at a time: if we
+# can't create the mutex, another view already owns it -> pull its window onto THIS
+# desktop (so it never yanks you elsewhere), focus it, and exit. The mutex is
+# released the instant this view closes (see FormClosed), so a task finishing right
+# after you close the view still pops a fresh one. The old process-scan guard could
+# mistake a just-closed (still-dying) process for a live instance and silently
+# swallow that popup — which is why the view didn't always appear.
+$mutexCreated = $false
+$script:viewMutex = New-Object System.Threading.Mutex($true, 'Local\ClaudeDeckView', [ref]$mutexCreated)
+if (-not $mutexCreated) {
+  $existing = [WinFocus]::FindExact($WindowTitle)
+  if ($existing -ne [System.IntPtr]::Zero) {
+    [VDesk]::FollowToCurrentDesktop($existing)
+    [WinFocus]::RaiseWindow($existing)
+  }
   exit 0
 }
-# Race guard: another view process may be starting before its window exists.
-$dupes = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-  Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like '*session-view.ps1*' })
-if ($dupes.Count -gt 0) { exit 0 }
 
 $stateDir    = Join-Path $env:USERPROFILE '.claude\sessions\state'
 $closeFlag   = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'   # opt-in: close on outside click
@@ -136,12 +142,12 @@ $sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'           
 # Preferences (position + opacity + size) are re-read on every refresh so changes
 # from the tray menu apply live without reopening the view.
 $script:position = 'center'
-$script:opacity  = 0.92          # default: light transparency (Legere)
+$script:opacity  = 0.92          # default: light transparency (Light)
 $script:widthPct = 55            # default window width (% of screen)
 function Read-Prefs {
   $script:position = 'center'
   try { if (Test-Path $posFile) { $p = (Get-Content $posFile -Raw -ErrorAction Stop).Trim().ToLower(); if ($p -in @('top','center','bottom')) { $script:position = $p } } } catch {}
-  $script:opacity = 0.92         # default: light transparency (Legere)
+  $script:opacity = 0.92         # default: light transparency (Light)
   try { if (Test-Path $opacityFile) { $v = [int]((Get-Content $opacityFile -Raw -ErrorAction Stop).Trim()); if ($v -ge 20 -and $v -le 100) { $script:opacity = $v / 100.0 } } } catch {}
   $script:widthPct = 55          # default window width
   try { if (Test-Path $sizeFile) { $w = [int]((Get-Content $sizeFile -Raw -ErrorAction Stop).Trim()); if ($w -ge 30 -and $w -le 95) { $script:widthPct = $w } } } catch {}
@@ -273,7 +279,7 @@ $header.BackColor = [System.Drawing.Color]::FromArgb(18, 18, 22)
 $form.Controls.Add($header)
 
 $title = New-Object System.Windows.Forms.Label
-$title.Text = 'Sessions Claude Code'
+$title.Text = 'Claude Code Sessions'
 $title.ForeColor = $white
 $title.Font = New-Object System.Drawing.Font('Segoe UI', $titlePt, [System.Drawing.FontStyle]::Bold)
 $title.AutoSize = $true
@@ -306,9 +312,9 @@ function New-PosButton($glyph, $tip) {
   $header.Controls.Add($b)
   return $b
 }
-$script:posTop = New-PosButton ([char]0x25B2) 'Position : en haut'
-$script:posMid = New-PosButton ([char]0x25AC) 'Position : au centre'
-$script:posBot = New-PosButton ([char]0x25BC) 'Position : en bas'
+$script:posTop = New-PosButton ([char]0x25B2) 'Position: top'
+$script:posMid = New-PosButton ([char]0x25AC) 'Position: center'
+$script:posBot = New-PosButton ([char]0x25BC) 'Position: bottom'
 
 # Highlight the active position; the others stay dim.
 function Update-PosHighlight {
@@ -332,7 +338,7 @@ foreach ($pb in @($script:posTop, $script:posMid, $script:posBot)) {
 Update-PosHighlight
 
 $hint = New-Object System.Windows.Forms.Label
-$hint.Text = 'Echap pour fermer'
+$hint.Text = 'Esc to close'
 $hint.ForeColor = $grey
 $hint.Font = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.7))
 $hint.AutoSize = $true
@@ -508,10 +514,10 @@ function Refresh-List {
     $status = [string]$s.status
     if ($status -ne 'running' -and $status -ne 'waiting') { $status = 'done' }
     $p = [string]$s.last_prompt
-    if (-not $p) { $p = '(pas de demande)' }
+    if (-not $p) { $p = '(no prompt)' }
     if ($p.Length -gt 90) { $p = $p.Substring(0, 90) + [char]0x2026 }
     $mins = [int]($now - $e.upd).TotalMinutes
-    $age = if ($mins -lt 1) { 'maintenant' } elseif ($mins -lt 60) { "${mins}m" } else { "$([int]($mins / 60))h" }
+    $age = if ($mins -lt 1) { 'now' } elseif ($mins -lt 60) { "${mins}m" } else { "$([int]($mins / 60))h" }
     $order = switch ($status) { 'waiting' { 0 } 'running' { 1 } default { 2 } }
     $seen  = [bool]$s.seen
     $unseenDone = ($status -eq 'done' -and -not $seen)   # finished & not yet opened -> border
@@ -544,7 +550,7 @@ function Refresh-List {
   $spinning = @()
   if ($rows.Count -eq 0) {
     $empty = New-Object System.Windows.Forms.Label
-    $empty.Text = 'Aucune session active'
+    $empty.Text = 'No active sessions'
     $empty.ForeColor = $grey
     $empty.Font = New-Object System.Drawing.Font('Segoe UI', $rowPt)
     $empty.AutoSize = $true
@@ -618,6 +624,12 @@ $clickTimer.Add_Tick({
 })
 $clickTimer.Start()
 
-$form.Add_FormClosed({ $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop(); $spinTimer.Stop() })
+$form.Add_FormClosed({
+  $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop(); $spinTimer.Stop()
+  # Release the single-instance mutex immediately so the next finished task can
+  # pop a fresh view without racing this process's shutdown.
+  try { $script:viewMutex.ReleaseMutex() } catch {}
+  try { $script:viewMutex.Dispose() } catch {}
+})
 
 [void]$form.ShowDialog()

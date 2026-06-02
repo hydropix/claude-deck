@@ -11,3 +11,6 @@ _*.ps1
 # OS
 Thumbs.db
 desktop.ini
+
+# Editor / workspace
+*.code-workspace

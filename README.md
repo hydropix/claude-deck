@@ -19,7 +19,6 @@ No Node, no Python, no dependencies — just PowerShell and a few Claude Code ho
 
 - **"Who just finished?" highlight** — when the overview pops up, the row of the session that just completed pulses green for a moment.
 - **Unopened-completion border** — a finished session you haven't opened yet gets a subtle blue outline; it clears the moment you click the row.
-- **Forgotten-task reminder** — a gentle nudge if a finished task sits unattended for a while.
 
 ### Act fast
 
@@ -72,7 +71,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 ## Usage
 
 - **Tray icon** → click for the compact session list; click a row to focus that session's editor window.
-- **Large view** → opens automatically when a task finishes, or via the global hotkey **`Win+Alt+C`**, the **ClaudeDeck (grand)** desktop shortcut, or the tray menu **Afficher en grand**. Close it with **`Esc`** or the **✕**.
+- **Large view** → opens automatically when a task finishes, or via the global hotkey **`Win+Alt+C`**, the **ClaudeDeck (Large)** desktop shortcut, or the tray menu **Show large view**. Close it with **`Esc`** or the **✕**.
 
 ## Options
 
@@ -80,11 +79,11 @@ Options live in the tray menu (state stored as small files under `~/.claude/sess
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| **Ne pas deranger** (Do Not Disturb) | off | Suspends the auto-popup on task completion and the forgotten-task reminders. |
-| **Fermer au clic exterieur** (close on outside click) | **off** | When on, the overview also closes on a click anywhere outside it (0.5s grace to avoid accidental closes). `Esc` / **✕** always work. |
-| **Transparence** (transparency) | Legere (92 %) | Sets the overview window opacity: Aucune / Legere / Moyenne / Forte (100 / 92 / 80 / 65 %). Applied live. |
-| **Taille** (size) | Normale (55 %) | Sets the overview width: Compacte / Normale / Large / Tres large (42 / 55 / 68 / 82 % of screen width). Applied live. |
-| **Mises a jour automatiques** (auto-update) | **off** | When on, ClaudeDeck checks the GitHub repo a couple of times a day for a newer version. See [Updates](#updates). |
+| **Do not disturb** | off | Suspends the auto-popup of the large view on task completion. |
+| **Close on outside click** | **off** | When on, the overview also closes on a click anywhere outside it (0.5s grace to avoid accidental closes). `Esc` / **✕** always work. |
+| **Transparency** | Light (92 %) | Sets the overview window opacity: None / Light / Medium / Strong (100 / 92 / 80 / 65 %). Applied live. |
+| **Size** | Normal (55 %) | Sets the overview width: Compact / Normal / Wide / Extra wide (42 / 55 / 68 / 82 % of screen width). Applied live. |
+| **Automatic updates** | **off** | When on, ClaudeDeck checks the GitHub repo a couple of times a day for a newer version. See [Updates](#updates). |
 
 **Position:** the overview header has three buttons next to **✕** — ▲ (top), ▬ (center), ▼ (bottom) — to dock the window to the top, middle, or bottom of the primary screen. The active one is highlighted; the choice is remembered.
 
@@ -94,9 +93,9 @@ Options live in the tray menu (state stored as small files under `~/.claude/sess
 
 ClaudeDeck can keep itself up to date from this GitHub repo — **opt-in, and off by default**.
 
-- Turn it on with the tray menu **Mises a jour automatiques** (or check on demand with **Verifier les mises a jour**).
+- Turn it on with the tray menu **Automatic updates** (or check on demand with **Check for updates**).
 - When enabled, the tray compares the installed version (`~/.claude/sessions/version.txt`) with [`scripts/version.txt`](scripts/version.txt) on the `main` branch a couple of times a day. The check runs in a hidden background process, so it never blocks the UI; if you're offline it simply does nothing.
-- If a newer version exists you get a tray balloon and an **Installer la mise a jour (vX)** entry at the top of the menu. Clicking it downloads the latest [`ClaudeDeck-Setup.cmd`](ClaudeDeck-Setup.cmd) and runs it — the same idempotent installer, so it refreshes the scripts, re-merges hooks, and restarts the tray.
+- If a newer version exists you get a tray balloon and an **Install update (vX)** entry at the top of the menu. Clicking it downloads the latest [`ClaudeDeck-Setup.cmd`](ClaudeDeck-Setup.cmd) and runs it — the same idempotent installer, so it refreshes the scripts, re-merges hooks, and restarts the tray.
 - The current version is always shown at the bottom of the tray menu.
 
 > The updater lives in [`scripts/session-update.ps1`](scripts/session-update.ps1). Forking? Change the `$Owner` / `$Repo` / `$Branch` variables at the top so it points at your own repo.

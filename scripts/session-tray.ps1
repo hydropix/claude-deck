@@ -76,7 +76,6 @@ $autoUpdFlag = Join-Path $env:USERPROFILE '.claude\sessions\autoupdate.flag'
 $updInfoFile = Join-Path $env:USERPROFILE '.claude\sessions\update.json'
 $updScript   = Join-Path $env:USERPROFILE '.claude\sessions\session-update.ps1'
 $verFile     = Join-Path $env:USERPROFILE '.claude\sessions\version.txt'
-$script:updNotified = $false
 
 function Get-LocalVersion {
   try { if (Test-Path $verFile) { return ([System.IO.File]::ReadAllText($verFile)).Trim() } } catch {}
@@ -149,13 +148,6 @@ $notify.Icon = [System.Drawing.SystemIcons]::Information
 $notify.Text = 'Claude Sessions'
 $notify.Visible = $true
 
-# Ballon de demarrage : aide a reperer l'icone (souvent dans la zone masquee ^)
-try {
-  $notify.BalloonTipTitle = 'Claude Sessions'
-  $notify.BalloonTipText  = 'Actif. Clique cette icone pour voir tes sessions.'
-  $notify.ShowBalloonTip(4000)
-} catch {}
-
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $notify.ContextMenuStrip = $menu
 
@@ -189,21 +181,21 @@ function Build-Menu {
   $sessions = @($sessions | Sort-Object @{ Expression = 'order' }, @{ Expression = 'upd'; Descending = $true })
 
   if ($sessions.Count -eq 0) {
-    $it = $menu.Items.Add('Aucune session active')
+    $it = $menu.Items.Add('No active sessions')
     $it.Enabled = $false
   } else {
     foreach ($e in $sessions) {
       $s = $e.s
       switch ($e.st) {
         'running' { $dot = [char]0x25CF; $fc = [System.Drawing.Color]::FromArgb(80, 200, 120) }   # ●
-        'waiting' { $dot = [char]0x25CF; $fc = [System.Drawing.Color]::FromArgb(235, 150, 40) }    # ● (attend)
+        'waiting' { $dot = [char]0x25CF; $fc = [System.Drawing.Color]::FromArgb(235, 150, 40) }    # ● (waiting)
         default   { $dot = [char]0x25CB; $fc = [System.Drawing.Color]::DimGray }                   # ○
       }
       $p = [string]$s.last_prompt
-      if (-not $p) { $p = '(pas de demande)' }
+      if (-not $p) { $p = '(no prompt)' }
       if ($p.Length -gt 64) { $p = $p.Substring(0, 64) + [char]0x2026 }
       $mins = [int]($now - $e.upd).TotalMinutes
-      $age = if ($mins -lt 1) { "maintenant" } elseif ($mins -lt 60) { "${mins}m" } else { "$([int]($mins/60))h" }
+      $age = if ($mins -lt 1) { "now" } elseif ($mins -lt 60) { "${mins}m" } else { "$([int]($mins/60))h" }
       $it = New-Object System.Windows.Forms.ToolStripMenuItem
       $sep = [char]0x2014   # em dash, built from code point (no non-ASCII literal in source)
       $ctxStr = Format-Ctx $s
@@ -220,26 +212,26 @@ function Build-Menu {
   # Prominent "install update" entry, shown only when a newer version was found.
   $upd = Get-UpdateInfo
   if ($upd) {
-    $ui = New-Object System.Windows.Forms.ToolStripMenuItem(("Installer la mise a jour (v{0})" -f $upd.latest))
+    $ui = New-Object System.Windows.Forms.ToolStripMenuItem(("Install update (v{0})" -f $upd.latest))
     $ui.ForeColor = [System.Drawing.Color]::FromArgb(80, 160, 90)
-    $ui.ToolTipText = "Telecharge et execute le dernier ClaudeDeck-Setup.cmd depuis GitHub"
+    $ui.ToolTipText = "Downloads and runs the latest ClaudeDeck-Setup.cmd from GitHub"
     $ui.Add_Click({ Invoke-Updater '-Apply' })
     [void]$menu.Items.Add($ui)
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
   }
 
-  $dnd = New-Object System.Windows.Forms.ToolStripMenuItem('Ne pas deranger')
+  $dnd = New-Object System.Windows.Forms.ToolStripMenuItem('Do not disturb')
   $dnd.Checked = (Test-Path $dndFlag)
-  $dnd.ToolTipText = "Suspend l'ouverture automatique de la grande vue et les rappels"
+  $dnd.ToolTipText = "Suspends the auto-popup of the large view on task completion"
   $dnd.Add_Click({
     if (Test-Path $dndFlag) { Remove-Item $dndFlag -Force -ErrorAction SilentlyContinue }
     else { Set-Content -LiteralPath $dndFlag -Value '' -Encoding ASCII }
   })
   [void]$menu.Items.Add($dnd)
 
-  $co = New-Object System.Windows.Forms.ToolStripMenuItem('Fermer au clic exterieur')
+  $co = New-Object System.Windows.Forms.ToolStripMenuItem('Close on outside click')
   $co.Checked = (Test-Path $closeFlag)
-  $co.ToolTipText = "Fermer la grande vue quand on clique en dehors (desactive par defaut)"
+  $co.ToolTipText = "Close the large view when clicking outside it (off by default)"
   $co.Add_Click({
     if (Test-Path $closeFlag) { Remove-Item $closeFlag -Force -ErrorAction SilentlyContinue }
     else { Set-Content -LiteralPath $closeFlag -Value '' -Encoding ASCII }
@@ -247,15 +239,15 @@ function Build-Menu {
   [void]$menu.Items.Add($co)
 
   # Transparency submenu — writes opacity % to opacity.txt (read live by the view).
-  $curOp = 92   # default: light transparency (Legere)
+  $curOp = 92   # default: light transparency (Light)
   try { if (Test-Path $opacityFile) { $curOp = [int]((Get-Content $opacityFile -Raw -ErrorAction Stop).Trim()) } } catch {}
-  $opMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Transparence')
-  $opMenu.ToolTipText = "Rend la grande vue plus ou moins transparente"
+  $opMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Transparency')
+  $opMenu.ToolTipText = "Make the large view more or less transparent"
   foreach ($lvl in @(
-      @{ v = 100; l = 'Aucune (opaque)' },
-      @{ v = 92;  l = 'Legere' },
-      @{ v = 80;  l = 'Moyenne' },
-      @{ v = 65;  l = 'Forte' })) {
+      @{ v = 100; l = 'None (opaque)' },
+      @{ v = 92;  l = 'Light' },
+      @{ v = 80;  l = 'Medium' },
+      @{ v = 65;  l = 'Strong' })) {
     $mi = New-Object System.Windows.Forms.ToolStripMenuItem($lvl.l)
     $mi.Checked = ($curOp -eq $lvl.v)
     $val = $lvl.v
@@ -267,13 +259,13 @@ function Build-Menu {
   # Size submenu — writes window width (% of screen) to size.txt (read live by the view).
   $curSize = 55
   try { if (Test-Path $sizeFile) { $curSize = [int]((Get-Content $sizeFile -Raw -ErrorAction Stop).Trim()) } } catch {}
-  $szMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Taille')
-  $szMenu.ToolTipText = "Largeur de la grande vue"
+  $szMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Size')
+  $szMenu.ToolTipText = "Width of the large view"
   foreach ($sz in @(
-      @{ v = 42; l = 'Compacte' },
-      @{ v = 55; l = 'Normale' },
-      @{ v = 68; l = 'Large' },
-      @{ v = 82; l = 'Tres large' })) {
+      @{ v = 42; l = 'Compact' },
+      @{ v = 55; l = 'Normal' },
+      @{ v = 68; l = 'Wide' },
+      @{ v = 82; l = 'Extra wide' })) {
     $mi = New-Object System.Windows.Forms.ToolStripMenuItem($sz.l)
     $mi.Checked = ($curSize -eq $sz.v)
     $val = $sz.v
@@ -285,21 +277,18 @@ function Build-Menu {
   [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
   # Auto-update toggle (opt-in / off by default) + manual check.
-  $au = New-Object System.Windows.Forms.ToolStripMenuItem('Mises a jour automatiques')
+  $au = New-Object System.Windows.Forms.ToolStripMenuItem('Automatic updates')
   $au.Checked = (Test-Path $autoUpdFlag)
-  $au.ToolTipText = "Verifie periodiquement le depot GitHub et propose d'installer les nouvelles versions"
+  $au.ToolTipText = "Periodically checks the GitHub repo and offers to install new versions"
   $au.Add_Click({
     if (Test-Path $autoUpdFlag) { Remove-Item $autoUpdFlag -Force -ErrorAction SilentlyContinue }
     else { Set-Content -LiteralPath $autoUpdFlag -Value '' -Encoding ASCII; Invoke-Updater '-Check' }
   })
   [void]$menu.Items.Add($au)
 
-  $chk = $menu.Items.Add('Verifier les mises a jour')
-  $chk.ToolTipText = "Cherche maintenant une nouvelle version sur GitHub"
-  $chk.Add_Click({
-    Invoke-Updater '-Check'
-    try { $notify.ShowBalloonTip(3000, 'ClaudeDeck', 'Recherche de mises a jour...', [System.Windows.Forms.ToolTipIcon]::Info) } catch {}
-  })
+  $chk = $menu.Items.Add('Check for updates')
+  $chk.ToolTipText = "Check GitHub for a new version now"
+  $chk.Add_Click({ Invoke-Updater '-Check' })
 
   $ver = Get-LocalVersion
   if ($ver) {
@@ -309,44 +298,14 @@ function Build-Menu {
 
   [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
-  $big = $menu.Items.Add('Afficher en grand')
+  $big = $menu.Items.Add('Show large view')
   $big.Add_Click({
     $vbs = Join-Path $env:USERPROFILE '.claude\sessions\show-view.vbs'
     Start-Process wscript.exe -ArgumentList ('"{0}"' -f $vbs) -ErrorAction SilentlyContinue
   })
-  $quit = $menu.Items.Add('Quitter')
+  $quit = $menu.Items.Add('Quit')
   $quit.Add_Click({ $notify.Visible = $false; [System.Windows.Forms.Application]::Exit() })
 }
-
-# Reminder: nudge once when a finished task has been sitting for a while
-# (so completed work isn't forgotten). Skipped while "Ne pas deranger" is on.
-$script:reminded = @{}
-$remindTimer = New-Object System.Windows.Forms.Timer
-$remindTimer.Interval = 60000   # check every minute
-$remindTimer.Add_Tick({
-  # Notify once per session when a new version is available (independent of DND).
-  if (-not $script:updNotified) {
-    $upd = Get-UpdateInfo
-    if ($upd) {
-      $script:updNotified = $true
-      try { $notify.ShowBalloonTip(6000, 'ClaudeDeck - mise a jour disponible', ("Version $($upd.latest) disponible. Clique l'icone -> Installer la mise a jour."), [System.Windows.Forms.ToolTipIcon]::Info) } catch {}
-    }
-  }
-  if (Test-Path $dndFlag) { return }
-  $now = Get-Date
-  if (-not (Test-Path $stateDir)) { return }
-  foreach ($f in Get-ChildItem $stateDir -Filter *.json -ErrorAction SilentlyContinue) {
-    try { $s = [System.IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json } catch { continue }
-    if ([string]$s.status -ne 'done') { continue }
-    try { $upd = [datetime]$s.updated } catch { continue }
-    $key = [string]$s.session_id + '|' + [string]$s.updated
-    if ((($now - $upd).TotalMinutes -ge 15) -and (-not $script:reminded.ContainsKey($key))) {
-      $script:reminded[$key] = $true
-      try { $notify.ShowBalloonTip(5000, 'Tache terminee en attente', ([string]$s.project + ' : ' + [string]$s.last_prompt), [System.Windows.Forms.ToolTipIcon]::Info) } catch {}
-    }
-  }
-})
-$remindTimer.Start()
 
 # Auto-update: an initial check shortly after start, then hourly (throttled to ~12h).
 $updTimer = New-Object System.Windows.Forms.Timer
@@ -375,7 +334,6 @@ $notify.Add_MouseClick({
 #   key (VK):  'C'=0x43  'S'=0x53  'D'=0x44  'J'=0x4A  F8=0x77  F9=0x78
 $HotMods = (1 -bor 8 -bor 0x4000)   # Win + Alt (+ no-repeat)
 $HotVk   = 0x43                     # C
-$HotLabel = 'Win+Alt+C'
 
 Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @"
 using System;
@@ -402,17 +360,11 @@ $hk.add_Pressed({
   Start-Process wscript.exe -ArgumentList ('"{0}"' -f $vbs) -ErrorAction SilentlyContinue
 })
 # Try the chosen combo; fall back to a couple of alternatives if it's taken.
-$registered = $null
 foreach ($try in @(
-    @{ m = $HotMods;                  v = $HotVk; lbl = $HotLabel },
-    @{ m = (1 -bor 8 -bor 0x4000);    v = 0x4A;   lbl = 'Win+Alt+J' },
-    @{ m = (2 -bor 1 -bor 0x4000);    v = 0x43;   lbl = 'Ctrl+Alt+C' })) {
-  if ($hk.Register([uint32]$try.m, [uint32]$try.v)) { $registered = $try.lbl; break }
+    @{ m = $HotMods;               v = $HotVk },
+    @{ m = (1 -bor 8 -bor 0x4000); v = 0x4A },   # Win+Alt+J
+    @{ m = (2 -bor 1 -bor 0x4000); v = 0x43 })) {  # Ctrl+Alt+C
+  if ($hk.Register([uint32]$try.m, [uint32]$try.v)) { break }
 }
-try {
-  if ($registered) {
-    $notify.ShowBalloonTip(4000, 'Claude Sessions', "Raccourci global : $registered (ouvre la grande vue)", [System.Windows.Forms.ToolTipIcon]::Info)
-  }
-} catch {}
 
 [System.Windows.Forms.Application]::Run()

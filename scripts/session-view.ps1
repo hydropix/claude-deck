@@ -147,6 +147,11 @@ $updScript   = Join-Path $env:USERPROFILE '.claude\sessions\session-update.ps1'
 $verFile     = Join-Path $env:USERPROFILE '.claude\sessions\version.txt'
 $statsVbs    = Join-Path $env:USERPROFILE '.claude\sessions\show-stats.vbs'
 
+# Pomodoro: the tray owns the clock + tracking and writes pomodoro.json; the deck
+# header just renders it and drops control tokens into pomodoro-cmd.txt.
+$pomoState   = Join-Path $env:USERPROFILE '.claude\sessions\pomodoro.json'
+$pomoCmd     = Join-Path $env:USERPROFILE '.claude\sessions\pomodoro-cmd.txt'
+
 function Get-LocalVersion {
   try { if (Test-Path $verFile) { return ([System.IO.File]::ReadAllText($verFile)).Trim() } } catch {}
   return $null
@@ -200,7 +205,8 @@ function Get-FavCount {
 #   settings e8b8  close e5cd  vertical_align_top/bottom e25a/e258
 #   fiber_manual_record e061 (filled)  radio_button_unchecked e836 (outline)
 $script:MAT = @{ top=0xE25A; bottom=0xE258; settings=0xE8B8; close=0xE5CD;
-                 dotFull=0xE061; dotEmpty=0xE836 }
+                 dotFull=0xE061; dotEmpty=0xE836;
+                 play=0xE037; pause=0xE034; skip=0xE044; replay=0xE042 }
 $script:matPfc    = $null
 $script:matFamily = $null
 $matPath = Join-Path $PSScriptRoot 'MaterialIcons-Regular.ttf'
@@ -480,6 +486,116 @@ $script:gear.Add_MouseEnter({ $script:gear.ForeColor = [System.Drawing.Color]::F
 $script:gear.Add_MouseLeave({ $script:gear.ForeColor = $grey })
 $header.Controls.Add($script:gear)
 
+# --- Pomodoro cluster (top row) --------------------------------------------
+# All Pomodoro UI lives here in the deck header. The tray runs the clock + the
+# focus tracking and publishes pomodoro.json; we render it and send control
+# tokens (toggle/skip/reset) via pomodoro-cmd.txt. Layout (left -> right):
+#   [play/pause]  MM:SS  <phase + status>  [skip] [replay]   ...then ▲ ▼ ⚙ ✕
+$blue = [System.Drawing.Color]::FromArgb(120, 175, 240)   # break accent (none defined yet in this view)
+
+function Send-PomoCmd([string]$cmd) {
+  try { Set-Content -LiteralPath $pomoCmd -Value $cmd -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+}
+
+# A clickable Material icon label for a Pomodoro control.
+function New-PomoIcon($matCode, $fallback, $tip) {
+  $b = New-Object System.Windows.Forms.Label
+  Set-IconLabel $b $matCode $fallback ([single]($script:posPt * 1.1))
+  $b.ForeColor = $grey
+  $b.AutoSize = $true
+  $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+  $posTip.SetToolTip($b, $tip)
+  # Literal colours here: $white/$grey aren't in this function's local scope, so
+  # GetNewClosure would capture them as null (matches the posTop/gear handlers).
+  $b.Add_MouseEnter({ $this.ForeColor = [System.Drawing.Color]::FromArgb(235, 235, 240) })
+  $b.Add_MouseLeave({ $this.ForeColor = [System.Drawing.Color]::FromArgb(150, 150, 158) })
+  $header.Controls.Add($b)
+  return $b
+}
+$script:pomoToggle = New-PomoIcon $script:MAT.play  0x25B6 'Start / pause the Pomodoro'
+$script:pomoSkip   = New-PomoIcon $script:MAT.skip  0x23ED 'Skip to the next phase'
+$script:pomoReset  = New-PomoIcon $script:MAT.replay 0x21BA 'Reset the current timer'
+
+$script:pomoTime = New-Object System.Windows.Forms.Label
+$script:pomoTime.ForeColor = $white
+$script:pomoTime.Font = New-Object System.Drawing.Font('Segoe UI', [single]($posPt * 1.05), [System.Drawing.FontStyle]::Bold)
+$script:pomoTime.AutoSize = $true
+$script:pomoTime.Text = '25:00'
+$header.Controls.Add($script:pomoTime)
+
+$script:pomoStatus = New-Object System.Windows.Forms.Label
+$script:pomoStatus.ForeColor = $grey
+$script:pomoStatus.Font = New-Object System.Drawing.Font('Segoe UI', [single]($posPt * 0.7))
+$script:pomoStatus.AutoSize = $true
+$script:pomoStatus.Text = 'Focus'
+$header.Controls.Add($script:pomoStatus)
+
+$script:pomoToggle.Add_Click({ Send-PomoCmd 'toggle' })
+$script:pomoSkip.Add_Click({ Send-PomoCmd 'skip' })
+$script:pomoReset.Add_Click({ Send-PomoCmd 'reset' })
+
+$script:pomoCycles = 4          # mirrors the tray's $CYCLES (long break grouping)
+$script:pomo = $null
+
+# Position the cluster left-to-right, just after the title.
+function Layout-Pomo {
+  if (-not $script:pomoToggle) { return }
+  $cy  = { param($c) [int](($script:headerH - $c.Height) / 2) }
+  $gap = [int][math]::Max(8, 12 * $script:scale)
+  $x   = $title.Location.X + $title.Width + [int][math]::Max(20, 26 * $script:scale)
+  foreach ($c in @($script:pomoToggle, $script:pomoTime, $script:pomoStatus, $script:pomoSkip, $script:pomoReset)) {
+    $c.Location = New-Object System.Drawing.Point($x, (& $cy $c))
+    $x += $c.Width + $gap
+  }
+}
+
+function Read-PomoState {
+  $script:pomo = $null
+  try { if (Test-Path $pomoState) { $script:pomo = [System.IO.File]::ReadAllText($pomoState) | ConvertFrom-Json } } catch {}
+}
+
+function Render-Pomo {
+  $o = $script:pomo
+  $running = $false; $remaining = ($script:pomoCycles * 0) + 1500; $track = 'paused'; $status = 'Ready'; $completed = 0
+  if ($o) {
+    $running   = [bool]$o.running
+    $remaining = [int]$o.remaining
+    $track     = [string]$o.track
+    $status    = [string]$o.status
+    $completed = [int]$o.completed
+  }
+  $mm = [int][math]::Floor($remaining / 60); $ss = [int]($remaining % 60)
+  $script:pomoTime.Text = ('{0:00}:{1:00}' -f $mm, $ss)
+  $script:pomoTime.ForeColor = if ($running) { $white } else { $grey }
+
+  # Play when paused, pause when running.
+  if ($running) { $script:pomoToggle.Text = Get-IconChar $script:MAT.pause 0x23F8 }
+  else          { $script:pomoToggle.Text = Get-IconChar $script:MAT.play  0x25B6 }
+
+  # Cycle dots toward the long break.
+  $done = $completed % $script:pomoCycles
+  $dots = ''
+  for ($i = 0; $i -lt $script:pomoCycles; $i++) { $dots += if ($i -lt $done) { [char]0x25CF } else { [char]0x25CB } }
+  if (-not $status) { $status = 'Ready' }
+  if ($status.Length -gt 26) { $status = $status.Substring(0, 26) + [char]0x2026 }
+  $script:pomoStatus.Text = ('{0}   {1}' -f $status, $dots)
+  $script:pomoStatus.ForeColor = switch ($track) { 'work' { $green } 'distract' { $orange } 'break' { $blue } default { $grey } }
+
+  Layout-Pomo
+}
+
+# Blink the status when off track (pulse, never spin - a ClaudeDeck convention).
+$script:pomoPulseOn = $false
+$pomoPulse = New-Object System.Windows.Forms.Timer
+$pomoPulse.Interval = 550
+$pomoPulse.Add_Tick({
+  if ($script:pomo -and [bool]$script:pomo.running -and ([string]$script:pomo.track -eq 'distract')) {
+    $script:pomoPulseOn = -not $script:pomoPulseOn
+    $script:pomoStatus.ForeColor = if ($script:pomoPulseOn) { $orange } else { $white }
+  }
+})
+$pomoPulse.Start()
+
 # The settings menu (rebuilt on every open so checkmarks reflect current state).
 $script:settingsMenu = New-Object System.Windows.Forms.ContextMenuStrip
 $script:menuOpen = $false
@@ -655,6 +771,7 @@ function Layout-Header {
   $x -= ($script:posBot.Width + 18); $script:posBot.Location = New-Object System.Drawing.Point($x, (& $cy $script:posBot))
   $x -= ($script:posTop.Width + 10); $script:posTop.Location = New-Object System.Drawing.Point($x, (& $cy $script:posTop))
   $x -= ($hint.Width + 24);          $hint.Location          = New-Object System.Drawing.Point($x, (& $cy $hint))
+  Layout-Pomo
 }
 $header.Add_Resize({ Layout-Header })
 
@@ -669,6 +786,12 @@ function Restyle {
     $pb.Font = New-IconFont ([single]($script:posPt * 1.15))
   }
   $script:gear.Font = New-IconFont ([single]($script:posPt * 1.15))
+  foreach ($c in @($script:pomoToggle, $script:pomoSkip, $script:pomoReset)) { $c.Font = New-IconFont ([single]($script:posPt * 1.1)) }
+  $script:pomoToggle.Text = Get-IconChar $script:MAT.play  0x25B6   # re-set so the glyph survives the re-font
+  $script:pomoSkip.Text   = Get-IconChar $script:MAT.skip  0x23ED
+  $script:pomoReset.Text  = Get-IconChar $script:MAT.replay 0x21BA
+  $script:pomoTime.Font   = New-Object System.Drawing.Font('Segoe UI', [single]($script:posPt * 1.05), [System.Drawing.FontStyle]::Bold)
+  $script:pomoStatus.Font = New-Object System.Drawing.Font('Segoe UI', [single]($script:posPt * 0.7))
   $hint.Font    = New-Object System.Drawing.Font('Segoe UI', [single]($script:rowPt * 0.7))
   $list.Padding = New-Object System.Windows.Forms.Padding($script:listPadX, $script:listPadY, $script:listPadX, $script:listPadY)
   Layout-Header
@@ -991,6 +1114,12 @@ $timer.Interval = 2000
 $timer.Add_Tick({ Refresh-List })
 $timer.Start()
 
+# Pomodoro display refresh (1s, so the clock ticks smoothly in the header).
+$pomoTimer = New-Object System.Windows.Forms.Timer
+$pomoTimer.Interval = 1000
+$pomoTimer.Add_Tick({ Read-PomoState; Render-Pomo })
+$pomoTimer.Start()
+
 # Follow the user across virtual desktops (feels pinned to all desktops).
 $followTimer = New-Object System.Windows.Forms.Timer
 $followTimer.Interval = 350
@@ -1004,7 +1133,7 @@ $form.Add_KeyDown({ if ($_.KeyCode -eq 'Escape') { $form.Close() } })
 # focus, so we poll the global mouse state rather than rely on Deactivate.
 $script:shownAt  = [Environment]::TickCount
 $script:prevDown = $false
-$form.Add_Shown({ $script:shownAt = [Environment]::TickCount; Refresh-List })
+$form.Add_Shown({ $script:shownAt = [Environment]::TickCount; Refresh-List; Read-PomoState; Render-Pomo })
 
 $clickTimer = New-Object System.Windows.Forms.Timer
 $clickTimer.Interval = 50
@@ -1019,7 +1148,7 @@ $clickTimer.Add_Tick({
 $clickTimer.Start()
 
 $form.Add_FormClosed({
-  $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop(); $spinTimer.Stop()
+  $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop(); $spinTimer.Stop(); $pomoTimer.Stop(); $pomoPulse.Stop()
   # Release the single-instance mutex immediately so the next finished task can
   # pop a fresh view without racing this process's shutdown.
   try { $script:viewMutex.ReleaseMutex() } catch {}

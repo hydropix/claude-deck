@@ -2,6 +2,12 @@
 
 > A minimalist Windows dashboard to keep an eye on all your running [Claude Code](https://claude.com/claude-code) sessions at a glance — and jump straight to the right editor window.
 
+<p align="center">
+  <a href="https://github.com/hydropix/claude-deck/raw/main/ClaudeDeck-Setup.cmd">
+    <img src="https://img.shields.io/badge/Download-ClaudeDeck--Setup.cmd-2ea44f?style=for-the-badge&logo=windows&logoColor=white" alt="Download ClaudeDeck-Setup.cmd">
+  </a>
+</p>
+
 When you juggle several very different projects, two costs pile up: knowing **which session needs you**, and **reloading context** when you switch. ClaudeDeck shows every open Claude Code session in one place — whether Claude is **working**, **waiting for you**, or **done**, with the last prompt for each — and lets you click to focus the exact VS Code / Cursor window. It lives in your system tray, with a large always-on-top overview that pops up whenever a task finishes.
 
 No Node, no Python, no dependencies — just PowerShell and a few Claude Code hooks.
@@ -42,7 +48,7 @@ No Node, no Python, no dependencies — just PowerShell and a few Claude Code ho
 
 ### One file, one click (recommended)
 
-1. Download **[`ClaudeDeck-Setup.cmd`](ClaudeDeck-Setup.cmd)** (right-click → *Save link as…*).
+1. Download **[`ClaudeDeck-Setup.cmd`](https://github.com/hydropix/claude-deck/raw/main/ClaudeDeck-Setup.cmd)** (the button above downloads it directly; or right-click the link → *Save link as…*).
 2. Double-click it.
 
 That's it. It's a single self-contained file — every script is embedded inside it, so there's nothing else to download and it works offline. No Node, no Python, no `git`.

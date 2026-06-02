@@ -84,6 +84,15 @@ foreach ($evt in @($hooks.Keys)) {
 }
 
 $cfg['hooks'] = $hooks
+
+# Silence Claude Code's built-in notification sound so ClaudeDeck's own chime
+# (played by session-tracker.ps1 on a genuine waiting state) is the single audible
+# cue. Only set when absent, so a user's explicit choice is never overridden.
+if (-not $cfg.Contains('preferredNotifChannel') -or -not $cfg['preferredNotifChannel']) {
+  $cfg['preferredNotifChannel'] = 'notifications_disabled'
+  Write-Host '  Native notification sound disabled (preferredNotifChannel)'
+}
+
 $json = $cfg | ConvertTo-Json -Depth 30
 [System.IO.File]::WriteAllText($settings, $json, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "  Hooks merged into $settings (backup: settings.json.bak)"

@@ -94,6 +94,17 @@ function Set-Ctx($o, $ctx) {
   }
 }
 
+# Discreet audible cue — replaces Claude Code's native notif sound, which the
+# installer turns off ("preferredNotifChannel":"notifications_disabled"). Played
+# when a session finishes a turn (stop) or needs the user (notify). Silenced under
+# Do-Not-Disturb; any failure stays silent. notify.wav sits next to this script
+# (deployed sessions dir, or scripts/ in the repo).
+function Play-Chime {
+  if (Test-Path (Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag')) { return }
+  $wav = Join-Path $PSScriptRoot 'notify.wav'
+  if (Test-Path $wav) { (New-Object System.Media.SoundPlayer $wav).PlaySync() }
+}
+
 switch ($Event) {
   'prompt' {
     $cwd = [string]$data.cwd
@@ -149,6 +160,7 @@ switch ($Event) {
       })
       Add-Event 'stop' $proj $ctx.tokens
     }
+    Play-Chime   # session finished a turn
   }
   'notify' {
     # Claude needs the user (permission request, question, etc.).
@@ -165,6 +177,7 @@ switch ($Event) {
         else { $o | Add-Member -NotePropertyName waiting_msg -NotePropertyValue $msg }
         Save $o
         Add-Event 'notify' ([string]$o.project) $null
+        Play-Chime   # session needs the user (permission/approval)
       }
     }
   }

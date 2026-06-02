@@ -50,6 +50,23 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\verify-bundle.ps1   
 `ClaudeDeck-Setup.cmd` is generated (base64-embedded scripts + a copy of `install.ps1`'s
 logic) — never edit it by hand. The version number comes from the latest git tag.
 
+## Releasing
+
+The git tag is the single source of truth for the version. **Default to a patch bump
+(`0.0.+1`)** — e.g. `v0.1.1` → `v0.1.2` — unless the user asks for a different one. The
+process (the tag drives `version.txt`, which auto-update clients compare against):
+
+```powershell
+git commit ...                     # land your changes first
+git tag v0.1.2                     # patch bump from the latest tag
+powershell -File .\tools\build-setup.ps1     # writes scripts/version.txt + regenerates the .cmd from the tag
+powershell -File .\tools\verify-bundle.ps1   # expect "--- ALL MATCH ---"
+git add scripts/version.txt ClaudeDeck-Setup.cmd
+git commit -m "Release v0.1.2: regenerate version.txt and installer from tag"
+git tag -f v0.1.2                  # move the tag onto the release commit
+git push origin main && git push origin v0.1.2
+```
+
 ## Language
 
 All user-facing text and comments are in **English**. Keep it that way.

@@ -5,9 +5,14 @@ param([ValidateSet('prompt','stop','end','notify')][string]$Event = 'prompt')
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-# Read hook payload (JSON) from stdin as RAW UTF-8 bytes.
-# This bypasses [Console]::InputEncoding (often an OEM codepage that mangles
-# accented chars). Falls back to $input for other invocation styles.
+# Read the hook payload (JSON) from stdin. Claude Code always sends UTF-8, but it
+# reaches us by one of two paths and which one wins is a timing race:
+#   1) the raw process stdin stream (OpenStandardInput) — pure bytes, we decode UTF-8;
+#   2) PowerShell's $input pipeline — the host decodes the bytes for us, using
+#      [Console]::InputEncoding. Its default is an OEM/ANSI code page, which mangles
+#      accents (UTF-8 "à" -> "Ã "). Forcing UTF-8 here, before $input is enumerated,
+#      makes that fallback decode correctly too.
+try { [Console]::InputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
 $raw = $null
 try {
   $stdin = [Console]::OpenStandardInput()
@@ -16,7 +21,7 @@ try {
   if ($ms.Length -gt 0) { $raw = [System.Text.Encoding]::UTF8.GetString($ms.ToArray()) }
 } catch {}
 if (-not $raw) { $raw = (@($input) -join "`n") }
-$raw = $raw.Trim()
+$raw = ([string]$raw).TrimStart([char]0xFEFF).Trim()   # drop a leading BOM, then whitespace
 if (-not $raw) { exit 0 }
 try { $data = $raw | ConvertFrom-Json } catch { exit 0 }
 

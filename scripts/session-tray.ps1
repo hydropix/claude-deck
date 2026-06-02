@@ -67,7 +67,7 @@ $stateDir    = Join-Path $env:USERPROFILE '.claude\sessions\state'
 $dndFlag     = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'
 $closeFlag   = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'
 $opacityFile = Join-Path $env:USERPROFILE '.claude\sessions\opacity.txt'   # 20..100 (window opacity %)
-$sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'      # 30..95  (window width, % of screen)
+$sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'      # 30..95  (overall scale; 55 = Normal/1.0, drives width + fonts)
 
 # --- Optional auto-update (off by default) ---------------------------------
 # When autoUpdFlag is present, the tray periodically asks session-update.ps1 to
@@ -143,8 +143,17 @@ function Format-Ctx($s) {
   return [string][int]$tok
 }
 
+# App icon: prefer the bundled logo.ico (sits next to this script, both in the
+# repo and once deployed to ~/.claude/sessions); fall back to a system icon.
+function Get-AppIcon {
+  $p = Join-Path $PSScriptRoot 'logo.ico'
+  if (Test-Path $p) { try { return New-Object System.Drawing.Icon($p) } catch {} }
+  return [System.Drawing.SystemIcons]::Information
+}
+$appIcon = Get-AppIcon
+
 $notify = New-Object System.Windows.Forms.NotifyIcon
-$notify.Icon = [System.Drawing.SystemIcons]::Information
+$notify.Icon = $appIcon
 $notify.Text = 'Claude Sessions'
 $notify.Visible = $true
 
@@ -256,16 +265,16 @@ function Build-Menu {
   }
   [void]$menu.Items.Add($opMenu)
 
-  # Size submenu — writes window width (% of screen) to size.txt (read live by the view).
-  $curSize = 55
+  # Size submenu — writes a size value to size.txt (read live by the view). The view
+  # scales the WHOLE layout from it (width, fonts, badges, paddings) — not just width.
+  $curSize = 48
   try { if (Test-Path $sizeFile) { $curSize = [int]((Get-Content $sizeFile -Raw -ErrorAction Stop).Trim()) } } catch {}
   $szMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Size')
-  $szMenu.ToolTipText = "Width of the large view"
+  $szMenu.ToolTipText = "Overall size of the large view (scales everything together)"
   foreach ($sz in @(
-      @{ v = 42; l = 'Compact' },
-      @{ v = 55; l = 'Normal' },
-      @{ v = 68; l = 'Wide' },
-      @{ v = 82; l = 'Extra wide' })) {
+      @{ v = 36; l = 'Compact' },
+      @{ v = 48; l = 'Normal' },
+      @{ v = 60; l = 'Large' })) {
     $mi = New-Object System.Windows.Forms.ToolStripMenuItem($sz.l)
     $mi.Checked = ($curSize -eq $sz.v)
     $val = $sz.v

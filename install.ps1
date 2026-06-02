@@ -90,12 +90,14 @@ Write-Host "  Hooks merged into $settings (backup: settings.json.bak)"
 
 # --- 3) Shortcuts ----------------------------------------------------------
 $ws = New-Object -ComObject WScript.Shell
+$icon = Join-Path $dest 'logo.ico'   # deployed alongside the scripts in step 1
 
 $startup = [Environment]::GetFolderPath('Startup')
 $lnk = $ws.CreateShortcut((Join-Path $startup 'ClaudeDeck Tray.lnk'))
 $lnk.TargetPath       = 'wscript.exe'
 $lnk.Arguments        = '"' + (Join-Path $dest 'start-tray.vbs') + '"'
 $lnk.WorkingDirectory = $dest
+if (Test-Path $icon) { $lnk.IconLocation = $icon }
 $lnk.Description       = 'ClaudeDeck tray'
 $lnk.Save()
 
@@ -104,7 +106,7 @@ $lnk2 = $ws.CreateShortcut((Join-Path $desktop 'ClaudeDeck (Large).lnk'))
 $lnk2.TargetPath       = 'wscript.exe'
 $lnk2.Arguments        = '"' + (Join-Path $dest 'show-view.vbs') + '"'
 $lnk2.WorkingDirectory = $dest
-$lnk2.IconLocation     = 'imageres.dll,109'
+$lnk2.IconLocation     = if (Test-Path $icon) { $icon } else { 'imageres.dll,109' }
 $lnk2.Description       = 'ClaudeDeck - large view'
 $lnk2.Save()
 Write-Host '  Startup + desktop shortcuts created'

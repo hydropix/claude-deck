@@ -137,29 +137,50 @@ $stateDir    = Join-Path $env:USERPROFILE '.claude\sessions\state'
 $closeFlag   = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'   # opt-in: close on outside click
 $posFile     = Join-Path $env:USERPROFILE '.claude\sessions\position.txt'        # top | center | bottom
 $opacityFile = Join-Path $env:USERPROFILE '.claude\sessions\opacity.txt'         # 20..100 (window opacity %)
-$sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'            # 30..95 (window width, % of screen)
+$sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'            # 30..95 (overall scale; 55 = Normal/1.0, drives width + fonts)
 
 # Preferences (position + opacity + size) are re-read on every refresh so changes
 # from the tray menu apply live without reopening the view.
 $script:position = 'center'
 $script:opacity  = 0.92          # default: light transparency (Light)
-$script:widthPct = 55            # default window width (% of screen)
+$script:widthPct = 48            # default size = Normal (% of screen width)
 function Read-Prefs {
   $script:position = 'center'
   try { if (Test-Path $posFile) { $p = (Get-Content $posFile -Raw -ErrorAction Stop).Trim().ToLower(); if ($p -in @('top','center','bottom')) { $script:position = $p } } } catch {}
   $script:opacity = 0.92         # default: light transparency (Light)
   try { if (Test-Path $opacityFile) { $v = [int]((Get-Content $opacityFile -Raw -ErrorAction Stop).Trim()); if ($v -ge 20 -and $v -le 100) { $script:opacity = $v / 100.0 } } } catch {}
-  $script:widthPct = 55          # default window width
+  $script:widthPct = 48          # default size = Normal
   try { if (Test-Path $sizeFile) { $w = [int]((Get-Content $sizeFile -Raw -ErrorAction Stop).Trim()); if ($w -ge 30 -and $w -le 95) { $script:widthPct = $w } } } catch {}
 }
 Read-Prefs
 
 # --- Sizing relative to the primary screen (looks right at any resolution) ---
+# The Size preference scales the WHOLE view homothetically: not just the window
+# width, but fonts, badges, paddings, row + header heights — everything grows or
+# shrinks together. The scale factor is $widthPct / 55 (55 is the 1.0 reference);
+# the presets sit below it for a compact feel: Compact 36% -> 0.65x, Normal 48% ->
+# 0.87x, Large 60% -> 1.09x.
 $screen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-$formW  = [int]($screen.Width  * $script:widthPct / 100)
 $formH  = [int]($screen.Height * 0.70)
-$titlePt = [single]([math]::Max(20, $screen.Height / 60))   # ~ 24pt on 1440p, scales on 4K
-$rowPt   = [single]([math]::Max(15, $screen.Height / 85))
+
+# Recompute every size-dependent dimension from the current $widthPct. Called at
+# startup and again whenever the Size preference changes live (see Refresh-List).
+function Compute-Dims {
+  $script:scale     = $script:widthPct / 55.0                                   # 55 = 1.0 reference
+  $script:formW     = [int]($screen.Width * $script:widthPct / 100)
+  $script:titlePt   = [single]([math]::Max(20, $screen.Height / 60) * $script:scale)
+  $script:rowPt     = [single]([math]::Max(15, $screen.Height / 85) * $script:scale)
+  $script:posPt     = [single]($script:titlePt * 0.6)
+  $script:headerH   = [int]($script:titlePt * 2.6)
+  $script:rowH      = [int]($script:rowPt * 3.4)
+  $script:rowMargin = [int][math]::Max(4, 10 * $script:scale)
+  $script:badgeSize = [int]($script:rowPt * 2.0)
+  $script:listPadX  = [int][math]::Max(8, 16 * $script:scale)
+  $script:listPadY  = [int][math]::Max(6, 12 * $script:scale)
+  $script:listPadV  = $script:listPadY * 2
+}
+Compute-Dims
+$script:appliedWidthPct = $script:widthPct   # tracks the size currently rendered
 
 # Vertical placement for a window of height $h, per the chosen position.
 function Get-FormTop($h) {
@@ -265,13 +286,16 @@ $form.TopMost         = $true
 $form.ShowInTaskbar   = $true
 $form.Text            = $WindowTitle
 $form.KeyPreview      = $true
+# Taskbar / Alt-Tab icon: the bundled logo.ico (next to this script, in the repo
+# and once deployed to ~/.claude/sessions). Silently skipped if missing.
+$iconPath = Join-Path $PSScriptRoot 'logo.ico'
+if (Test-Path $iconPath) { try { $form.Icon = New-Object System.Drawing.Icon($iconPath) } catch {} }
 
 # Reduce flicker: enable double buffering (protected property, set via reflection).
 $dbProp = [System.Windows.Forms.Control].GetProperty('DoubleBuffered', [System.Reflection.BindingFlags]'Instance,NonPublic')
 $dbProp.SetValue($form, $true, $null)
 
 # Header
-$headerH = [int]($titlePt * 2.6)
 $header = New-Object System.Windows.Forms.Panel
 $header.Dock = 'Top'
 $header.Height = $headerH
@@ -300,7 +324,6 @@ $header.Controls.Add($close)
 
 # --- Position buttons (▲ top, ▬ middle, ▼ bottom) — to the left of X ---
 $posTip = New-Object System.Windows.Forms.ToolTip
-$posPt  = [single]($titlePt * 0.6)
 function New-PosButton($glyph, $tip) {
   $b = New-Object System.Windows.Forms.Label
   $b.Text = $glyph
@@ -346,15 +369,31 @@ $header.Controls.Add($hint)
 
 # Keep X, the position buttons and the hint pinned to the right edge.
 # Layout from the right:  [hint]  ▲ ▬ ▼   ✕
-$header.Add_Resize({
-  $cy = { param($c) [int](($headerH - $c.Height) / 2) }
+function Layout-Header {
+  $cy = { param($c) [int](($script:headerH - $c.Height) / 2) }
   $x  = $header.Width - 20
-  $x -= $close.Width;          $close.Location          = New-Object System.Drawing.Point($x, (& $cy $close))
+  $x -= $close.Width;                $close.Location         = New-Object System.Drawing.Point($x, (& $cy $close))
   $x -= ($script:posBot.Width + 18); $script:posBot.Location = New-Object System.Drawing.Point($x, (& $cy $script:posBot))
   $x -= ($script:posMid.Width + 10); $script:posMid.Location = New-Object System.Drawing.Point($x, (& $cy $script:posMid))
   $x -= ($script:posTop.Width + 10); $script:posTop.Location = New-Object System.Drawing.Point($x, (& $cy $script:posTop))
-  $x -= ($hint.Width + 24);    $hint.Location           = New-Object System.Drawing.Point($x, (& $cy $hint))
-})
+  $x -= ($hint.Width + 24);          $hint.Location          = New-Object System.Drawing.Point($x, (& $cy $hint))
+}
+$header.Add_Resize({ Layout-Header })
+
+# Re-apply the current scale to every header control (fonts + heights). Called
+# when the Size preference changes live so text grows/shrinks with the window.
+function Restyle {
+  $header.Height  = $script:headerH
+  $title.Font     = New-Object System.Drawing.Font('Segoe UI', $script:titlePt, [System.Drawing.FontStyle]::Bold)
+  $title.Location = New-Object System.Drawing.Point(24, [int](($script:headerH - $title.PreferredHeight) / 2))
+  $close.Font     = New-Object System.Drawing.Font('Segoe UI', $script:titlePt, [System.Drawing.FontStyle]::Bold)
+  foreach ($pb in @($script:posTop, $script:posMid, $script:posBot)) {
+    $pb.Font = New-Object System.Drawing.Font('Segoe UI', $script:posPt, [System.Drawing.FontStyle]::Bold)
+  }
+  $hint.Font    = New-Object System.Drawing.Font('Segoe UI', [single]($script:rowPt * 0.7))
+  $list.Padding = New-Object System.Windows.Forms.Padding($script:listPadX, $script:listPadY, $script:listPadX, $script:listPadY)
+  Layout-Header
+}
 
 # Scrollable list
 $list = New-Object System.Windows.Forms.FlowLayoutPanel
@@ -363,15 +402,12 @@ $list.FlowDirection = 'TopDown'
 $list.WrapContents = $false
 $list.AutoScroll = $true
 $list.BackColor = $bg
-$listPadV = 24   # top + bottom padding
-$list.Padding = New-Object System.Windows.Forms.Padding(16, 12, 16, 12)
+$list.Padding = New-Object System.Windows.Forms.Padding($script:listPadX, $script:listPadY, $script:listPadX, $script:listPadY)
 $dbProp.SetValue($list, $true, $null)   # double-buffer the list too
 $form.Controls.Add($list)
 $list.BringToFront()
 
-$rowH = [int]($rowPt * 3.4)
-$rowMargin = 10
-$badgeSize = [int]($rowPt * 2.0)
+# $rowH, $rowMargin and $badgeSize are computed in Compute-Dims (scale-aware).
 
 # Spinner frames for "running" (a rotating half-disc) — animated by $spinTimer.
 $script:spinFrames = @([char]0x25D0, [char]0x25D3, [char]0x25D1, [char]0x25D2)   # ◐ ◓ ◑ ◒
@@ -400,28 +436,52 @@ function Make-Row($s, $status, $seen, $promptText, $age) {
   $btn.ImageAlign = 'MiddleLeft'
   $btn.Image = New-Badge ([string]$s.project) $badgeSize   # coloured square + initials
   $btn.Padding = New-Object System.Windows.Forms.Padding(14, 0, 18, 0)
-  $btn.Width  = $list.ClientSize.Width - 40
+  $btn.Width  = $list.ClientSize.Width - ($script:listPadX * 2 + 8)
   $btn.Height = $rowH
   $btn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, $rowMargin)
   $btn.TabStop = $false
   $sep = [char]0x2014
-  $ctxStr = Format-Ctx $s
-  $ctxPart = if ($ctxStr) { '    ' + [char]0x2022 + ' ' + $ctxStr } else { '' }   # • 117k (59%)
-  $rest = ('  {0}    {1}    {2}    ({3}){4}' -f $s.project, $sep, $promptText, $age, $ctxPart)
+  $rest = ('  {0}    {1}    {2}    ({3})' -f $s.project, $sep, $promptText, $age)
+  $btn.AutoEllipsis = $true                          # truncate with "…" instead of wrapping to a 2nd line
   $btn.Text = '  ' + $glyph + $rest
   if ($status -eq 'running') { $btn.Tag = $rest }   # spinner timer rewrites: '  ' + frame + Tag
   $btn.Add_Disposed({ param($snd, $e) try { if ($snd.Image) { $snd.Image.Dispose() } } catch {} })
+
+  # Context size lives in its OWN slot pinned to the right edge — never part of the
+  # row text, so a long prompt can't push it onto a second line (the text ellipsizes).
+  $ctxLbl = $null
+  $ctxStr = Format-Ctx $s
+  if ($ctxStr) {
+    $ctxLbl = New-Object System.Windows.Forms.Label
+    $ctxLbl.Text      = [char]0x2022 + ' ' + $ctxStr        # • 117k
+    $ctxLbl.Font      = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.85))
+    $ctxLbl.ForeColor = $grey
+    $ctxLbl.BackColor = [System.Drawing.Color]::Transparent  # let the row bg (breathe/flash) show through
+    $ctxLbl.AutoSize  = $true
+    $ctxLbl.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    $ctxRight = 18
+    $ctxLbl.Anchor   = 'Top, Right'
+    $ctxLbl.Location = New-Object System.Drawing.Point(
+      ($btn.Width - $ctxLbl.PreferredWidth - $ctxRight),
+      [int](($btn.Height - $ctxLbl.PreferredHeight) / 2))
+    $btn.Controls.Add($ctxLbl)
+    # Reserve room on the right so the ellipsized text never runs under the ctx slot.
+    $btn.Padding = New-Object System.Windows.Forms.Padding(14, 0, ($ctxLbl.PreferredWidth + $ctxRight + 12), 0)
+  }
+
   $proj = [string]$s.project
   $cwd  = [string]$s.cwd
   $sid  = [string]$s.session_id
-  $btn.Add_Click({
+  $clickHandler = {
     Set-Seen $sid                                          # mark this completion as opened
     if (-not [WinFocus]::FocusByTitle($proj)) {
       # Fallback: focus/open the REAL VS Code (never Cursor).
       $codeExe = (Get-Process -Name Code -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1).Path
       if ($codeExe -and $cwd) { Start-Process $codeExe -ArgumentList ('"{0}"' -f $cwd) -ErrorAction SilentlyContinue }
     }
-  }.GetNewClosure())
+  }.GetNewClosure()
+  $btn.Add_Click($clickHandler)
+  if ($ctxLbl) { $ctxLbl.Add_Click($clickHandler) }   # the ctx slot is part of the clickable row
   return $btn
 }
 
@@ -484,13 +544,14 @@ function Refresh-List {
   Read-Prefs
   Update-PosHighlight
   if ($form.Opacity -ne $script:opacity) { $form.Opacity = $script:opacity }
-  $wantW = [int]($screen.Width * $script:widthPct / 100)
-  if ($script:formW -ne $wantW) {
-    $script:formW    = $wantW
-    $script:formLeft = [int]($screen.X + ($screen.Width - $wantW) / 2)
-    $form.Width      = $wantW
+  if ($script:appliedWidthPct -ne $script:widthPct) {
+    $script:appliedWidthPct = $script:widthPct
+    Compute-Dims                        # rescale fonts/badges/paddings + width together
+    Restyle                             # re-font the header to the new scale
+    $script:formLeft = [int]($screen.X + ($screen.Width - $script:formW) / 2)
+    $form.Width      = $script:formW
     $form.Left       = $script:formLeft
-    $script:lastSig  = $null            # force a row rebuild so rows reflow to the new width
+    $script:lastSig  = $null            # force a row rebuild so rows re-font + reflow
   }
   $wantTop = Get-FormTop $form.Height
   if ($form.Top -ne $wantTop) { $form.Top = $wantTop }

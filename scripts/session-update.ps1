@@ -1,6 +1,8 @@
 # ClaudeDeck self-updater (optional) — checks the GitHub repo for a newer version.
-#   -Check : compare the installed version with the repo's scripts/version.txt,
-#            write the result to update.json (read by the tray). Never throws.
+#   -Check : compare the installed version with the repo's scripts/version.txt
+#            and flag an update whenever they DIFFER (the published version is
+#            canonical). Writes the result to update.json (read by the desk/tray).
+#            Never throws.
 #   -Apply : download the latest ClaudeDeck-Setup.cmd from the repo and run it
 #            (the installer reinstalls the scripts, merges hooks, and restarts
 #            the tray — it is idempotent and non-destructive).
@@ -56,11 +58,18 @@ if ($Check) {
     $latest = ([string]$resp.Content).Trim()
   } catch {}
 
-  if (-not $latest) {
+  # Reject an empty body or anything that isn't a dotted-numeric version (e.g. a
+  # CDN error page served as HTML) so we never offer a bogus "update".
+  if (-not $latest -or ($latest -notmatch '^\d+(\.\d+){0,3}$')) {
     Save-Info ([ordered]@{ current = $local; latest = $null; available = $false; error = 'fetch-failed'; checked = (Get-Date).ToString('o') })
     exit 0
   }
-  $available = ((Compare-Version $latest $local) -gt 0)
+  # GitHub is the single source of truth and the only distribution channel, so the
+  # published version is canonical. Offer the update whenever it DIFFERS from the
+  # installed one - not only when it is strictly greater. This keeps self-update
+  # working even when the local version.txt is missing, corrupted, or somehow ahead
+  # of the release (e.g. a stray "1.0.0" that would otherwise block every update).
+  $available = ((Compare-Version $latest $local) -ne 0)
   Save-Info ([ordered]@{ current = $local; latest = $latest; available = $available; checked = (Get-Date).ToString('o') })
   exit 0
 }

@@ -1393,15 +1393,15 @@ function Refresh-List {
 }
 
 # --- Focus-nudge "Matrix" animation -------------------------------------------
-# When the tray fires a focus nudge it stamps focus-nudge.txt. Instead of a plain
-# flash we run a short green digital-rain gag over the deck with an ASCII Claude
-# mascot + a wink line ("Wake up... let's code"), ~2s then fade. Only shows if the
-# deck is open; the taskbar FlashWindowEx still fires regardless.
+# When the tray fires a focus nudge it stamps focus-nudge.txt. We run a green
+# digital-rain gag in the deck's top bar (the "Claude Code Sessions" strip) with
+# a one-line wink; it stays up until you CLICK it (then fades out). The taskbar
+# FlashWindowEx fires regardless, and the tray pops the deck open if it was closed.
 $script:fxCW       = 16     # rain cell width (px)
 $script:fxCH       = 18     # rain cell height (px)
 $script:fxTrailLen = 11     # glyphs per falling column
-$script:fxMaxFrames = 34    # ~34 * 60ms ~= 2s
 $script:fxActive   = $false
+$script:fxFading   = $false # set true on click -> fade out, then stop + hide
 $script:fxFrame    = 0
 $script:fxAlpha    = 1.0
 $script:fxHeads    = @()
@@ -1409,28 +1409,20 @@ $script:fxSpeed    = @()
 $script:fxLine     = ''
 # ASCII glyphs (ASCII only, so any monospace font renders them - no tofu boxes).
 $script:fxGlyphs = ('0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ$+*<>=/\|?!#%&{}[]'.ToCharArray())
-# Green ASCII Claude mascot (the '*' up top nods to the Claude Code sparkle).
-$script:fxArt = @(
-  '    .  *  .    ',
-  '   ._______.   ',
-  '   | o   o |   ',
-  '   |   _   |   ',
-  '   |  (_)  |   ',
-  '   |_______|   ',
-  '    || | ||    ')
+# One-line wink (the deck header is a thin strip, so the Claude "mascot" is a
+# compact bracket-face rather than the tall ASCII bot). Drawn centered over the rain.
 $script:fxLines = @(
-  "Wake up... the code won't write itself.",
-  "Follow the white rabbit -> your TODOs.",
-  "There is no spoon. Only un-merged branches.",
-  "Knock knock. Claude wants to build.",
-  "I know kung-fu. And also your codebase.",
-  "Come back to the Matrix. Bring coffee.")
+  "[o_o]  Wake up... the code won't write itself.",
+  "[o_o]  Follow the white rabbit -> your TODOs.",
+  "[-_-]  There is no spoon. Only un-merged branches.",
+  "[o_o]  Knock knock. Claude wants to build.",
+  "[>_>]  I know kung-fu. And also your codebase.",
+  "[o_o]  Come back to the Matrix. Bring coffee.")
 
 $script:fxFont      = New-Object System.Drawing.Font('Consolas', 13)
-$script:fxArtFont   = New-Object System.Drawing.Font('Consolas', 15, [System.Drawing.FontStyle]::Bold)
+$script:fxArtFont   = New-Object System.Drawing.Font('Consolas', 14, [System.Drawing.FontStyle]::Bold)
 $script:fxHeadBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(205, 255, 205))
-$script:fxArtBrush  = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(150, 255, 170))
-$script:fxLineBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(120, 255, 140))
+$script:fxArtBrush  = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(160, 255, 180))
 $script:fxTrail     = New-Object 'System.Drawing.SolidBrush[]' $script:fxTrailLen
 for ($t = 0; $t -lt $script:fxTrailLen; $t++) {
   $gv = [int][math]::Max(60, 255 - $t * 20)
@@ -1442,7 +1434,7 @@ $fx = New-Object System.Windows.Forms.Panel
 $fx.BackColor = [System.Drawing.Color]::Black
 $fx.Visible = $false
 $dbProp.SetValue($fx, $true, $null)   # double-buffer (same trick as the form)
-$fx.Add_Click({ $script:fxFrame = $script:fxMaxFrames })   # click anywhere to dismiss early
+$fx.Add_Click({ $script:fxFading = $true })   # click anywhere to fade out + dismiss
 $fx.Add_Paint({
   param($snd, $e)
   $g = $e.Graphics
@@ -1463,21 +1455,16 @@ $fx.Add_Paint({
       $g.DrawString([string]$script:fxGlyphs[$idx], $script:fxFont, $brush, [single]$x, [single]$y)
     }
   }
-  # Centered mascot + wink line, on a dark backdrop for readability.
+  # Centered one-line wink on a dark backdrop, vertically centered in the bar.
   $sf = New-Object System.Drawing.StringFormat
   $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
-  $artText = ($script:fxArt -join "`n")
-  $artSize = $g.MeasureString($artText, $script:fxArtFont)
-  $lineSize = $g.MeasureString($script:fxLine, $script:fxFont)
-  $blockW = [math]::Max($artSize.Width, $lineSize.Width)
-  $blockH = $artSize.Height + 10 + $lineSize.Height
-  $top = [single](($h - $blockH) / 2)
-  $pad = 18
-  $veil = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(160, 0, 0, 0))
-  $g.FillRectangle($veil, [single](($w - $blockW) / 2 - $pad), [single]($top - $pad), [single]($blockW + 2 * $pad), [single]($blockH + 2 * $pad))
+  $lineSize = $g.MeasureString($script:fxLine, $script:fxArtFont)
+  $bw = [math]::Min($w, $lineSize.Width + 32)
+  $bh = [math]::Min($h, $lineSize.Height + 12)
+  $veil = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(175, 0, 0, 0))
+  $g.FillRectangle($veil, [single](($w - $bw) / 2), [single](($h - $bh) / 2), [single]$bw, [single]$bh)
   $veil.Dispose()
-  $g.DrawString($artText, $script:fxArtFont, $script:fxArtBrush, (New-Object System.Drawing.RectangleF(0, $top, $w, $artSize.Height)), $sf)
-  $g.DrawString($script:fxLine, $script:fxFont, $script:fxLineBrush, (New-Object System.Drawing.RectangleF(0, ($top + $artSize.Height + 10), $w, $lineSize.Height)), $sf)
+  $g.DrawString($script:fxLine, $script:fxArtFont, $script:fxArtBrush, (New-Object System.Drawing.RectangleF(0, 0, $w, $h)), $sf)
   # Fade-out veil over the whole frame.
   if ($script:fxAlpha -lt 1.0) {
     $a = [int]((1.0 - $script:fxAlpha) * 255)
@@ -1510,12 +1497,14 @@ $fxTimer.Add_Tick({
       $script:fxSpeed[$i] = [double](Get-Random -Minimum 8 -Maximum 26)
     }
   }
-  $fadeStart = $script:fxMaxFrames - 8
-  if ($script:fxFrame -ge $fadeStart) { $script:fxAlpha = [math]::Max(0.0, 1.0 - (($script:fxFrame - $fadeStart) / 8.0)) }
-  if ($script:fxFrame -ge $script:fxMaxFrames) {
-    $fxTimer.Stop(); $script:fxActive = $false; $fx.Visible = $false
-    try { $form.Refresh() } catch {}
-    return
+  # Runs indefinitely until clicked; a click starts a short fade-out, then we stop.
+  if ($script:fxFading) {
+    $script:fxAlpha = [math]::Max(0.0, $script:fxAlpha - (1.0 / 8.0))
+    if ($script:fxAlpha -le 0.0) {
+      $fxTimer.Stop(); $script:fxActive = $false; $script:fxFading = $false; $fx.Visible = $false
+      try { $form.Refresh() } catch {}
+      return
+    }
   }
   $fx.Invalidate()
 })
@@ -1523,10 +1512,12 @@ $fxTimer.Add_Tick({
 function Flash-Deck {
   try { [WinFocus]::Flash($form.Handle, 4) } catch {}
   if ($script:fxActive) { return }
-  $script:fxLine  = $script:fxLines | Get-Random
-  $script:fxFrame = 0
-  $script:fxAlpha = 1.0
-  $fx.Bounds = $form.ClientRectangle
+  $script:fxLine   = $script:fxLines | Get-Random
+  $script:fxFrame  = 0
+  $script:fxAlpha  = 1.0
+  $script:fxFading = $false
+  # Header strip only (the "Claude Code Sessions" bar), not the whole deck.
+  $fx.Bounds = New-Object System.Drawing.Rectangle(0, 0, $form.ClientSize.Width, $header.Height)
   Fx-Init
   $fx.Visible = $true
   $fx.BringToFront()

@@ -1,7 +1,14 @@
-# Claude Sessions — minimalist Windows tray app.
-# Left/right click the tray icon: list of active Claude Code sessions.
-#   ● green = Claude is working   ○ grey = finished
-# Click a session -> focus its VS Code / Cursor window (by title, no new window).
+# Claude Sessions - minimalist Windows tray launcher.
+#
+# The tray is intentionally tiny: its menu holds only the essentials - open the
+# large view ("the desk") and quit. Everything else - the live session list AND
+# every setting (Do-not-disturb, transparency, size, updates, statistics, the
+# favorite-workspaces save/reopen) - lives in the desk's on-screen gear menu (see
+# session-view.ps1), which is the single canonical control surface.
+#
+# The tray still earns its keep by: owning the global hotkey (Win+Alt+C) that opens
+# the desk from anywhere, and running the background auto-update check that the desk
+# then surfaces.
 
 # Single-instance guard: if another tray process is already running, exit.
 # (A named mutex proved unreliable here, so we scan for a sibling process.)
@@ -12,76 +19,16 @@ if ($dupes.Count -gt 0) { exit 0 }
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# --- Win32 helper: focus an existing IDE window by title substring ---
-Add-Type -TypeDefinition @"
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-public class WinFocus {
-  [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc cb, IntPtr l);
-  delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
-  [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-  [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
-  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
-  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
-  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
-  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
-  [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool f);
-  [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
-  [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
-  const int SW_RESTORE = 9;
-
-  public static bool FocusByTitle(string needle) {
-    IntPtr found = IntPtr.Zero;
-    EnumWindows(delegate(IntPtr h, IntPtr l) {
-      if (!IsWindowVisible(h)) return true;
-      int len = GetWindowTextLength(h);
-      if (len == 0) return true;
-      StringBuilder sb = new StringBuilder(len + 1);
-      GetWindowText(h, sb, sb.Capacity);
-      string t = sb.ToString();
-      bool isIde = t.IndexOf("Visual Studio Code", StringComparison.OrdinalIgnoreCase) >= 0
-                || t.IndexOf("Cursor", StringComparison.OrdinalIgnoreCase) >= 0;
-      if (isIde && t.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) {
-        found = h; return false;
-      }
-      return true;
-    }, IntPtr.Zero);
-    if (found == IntPtr.Zero) return false;
-    if (IsIconic(found)) ShowWindow(found, SW_RESTORE);  // only un-minimize; never resize a maximized/normal window
-    uint pid;
-    uint fg = GetWindowThreadProcessId(GetForegroundWindow(), out pid);
-    uint cur = GetCurrentThreadId();
-    AttachThreadInput(cur, fg, true);
-    BringWindowToTop(found);
-    SetForegroundWindow(found);
-    AttachThreadInput(cur, fg, false);
-    return true;
-  }
-}
-"@
-
-$stateDir    = Join-Path $env:USERPROFILE '.claude\sessions\state'
-$dndFlag     = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'
-$closeFlag   = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'
-$opacityFile = Join-Path $env:USERPROFILE '.claude\sessions\opacity.txt'   # 20..100 (window opacity %)
-$sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'      # 30..95  (overall scale; 55 = Normal/1.0, drives width + fonts)
-
-# --- Optional auto-update (off by default) ---------------------------------
+# --- Background auto-update (off by default) -------------------------------
 # When autoUpdFlag is present, the tray periodically asks session-update.ps1 to
-# compare the installed version with the GitHub repo and writes update.json.
+# compare the installed version with the GitHub repo and writes update.json. The
+# desk's gear menu reads that file and offers the install. The toggle itself also
+# lives in the desk - the tray only runs the check.
 $autoUpdFlag = Join-Path $env:USERPROFILE '.claude\sessions\autoupdate.flag'
 $updInfoFile = Join-Path $env:USERPROFILE '.claude\sessions\update.json'
 $updScript   = Join-Path $env:USERPROFILE '.claude\sessions\session-update.ps1'
-$verFile     = Join-Path $env:USERPROFILE '.claude\sessions\version.txt'
 
-function Get-LocalVersion {
-  try { if (Test-Path $verFile) { return ([System.IO.File]::ReadAllText($verFile)).Trim() } } catch {}
-  return $null
-}
-# Launch a version check / install in a hidden background process (never blocks the UI).
+# Launch a version check in a hidden background process (never blocks the UI).
 function Invoke-Updater([string]$mode) {
   if (-not (Test-Path $updScript)) { return }
   Start-Process powershell -WindowStyle Hidden -ArgumentList @(
@@ -98,49 +45,6 @@ function Invoke-UpdateCheckThrottled {
     }
   } catch {}
   Invoke-Updater '-Check'
-}
-# Read the last check result -> the parsed object when an update is available, else $null.
-function Get-UpdateInfo {
-  try {
-    if (Test-Path $updInfoFile) {
-      $j = [System.IO.File]::ReadAllText($updInfoFile) | ConvertFrom-Json
-      if ($j.available) { return $j }
-    }
-  } catch {}
-  return $null
-}
-
-# Per-project accent colour (hash of name -> hue) + a small colour swatch icon.
-function Hue2Rgb($p, $q, $t) {
-  if ($t -lt 0) { $t += 1 }; if ($t -gt 1) { $t -= 1 }
-  if ($t -lt (1.0/6)) { return $p + ($q - $p) * 6 * $t }
-  if ($t -lt 0.5)     { return $q }
-  if ($t -lt (2.0/3)) { return $p + ($q - $p) * ((2.0/3) - $t) * 6 }
-  return $p
-}
-function Get-ProjectColor($name) {
-  if (-not $name) { $name = '?' }
-  $hsh = 0
-  foreach ($c in $name.ToCharArray()) { $hsh = [int](($hsh * 31 + [int]$c) % 360) }
-  $h = $hsh / 360.0; $s = 0.55; $l = 0.62
-  $q = if ($l -lt 0.5) { $l * (1 + $s) } else { $l + $s - $l * $s }
-  $p = 2 * $l - $q
-  $r = Hue2Rgb $p $q ($h + 1.0/3); $g = Hue2Rgb $p $q $h; $b = Hue2Rgb $p $q ($h - 1.0/3)
-  return [System.Drawing.Color]::FromArgb([int]($r * 255), [int]($g * 255), [int]($b * 255))
-}
-function New-Swatch($color) {
-  $bmp = New-Object System.Drawing.Bitmap(16, 16)
-  $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.Clear($color); $g.Dispose()
-  return $bmp
-}
-# Context occupied, compact: "117k" — empty when unknown (old state files).
-# We show raw tokens only (no %), since the model's true context window isn't reliably known.
-function Format-Ctx($s) {
-  $tok = $s.ctx_tokens
-  if ($null -eq $tok) { return '' }
-  if ([int]$tok -ge 1000) { return '{0}k' -f [int][math]::Round([int]$tok / 1000.0) }
-  return [string][int]$tok
 }
 
 # App icon: prefer the bundled logo.ico (sits next to this script, both in the
@@ -160,163 +64,26 @@ $notify.Visible = $true
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $notify.ContextMenuStrip = $menu
 
-function Add-Click($item, $proj, $cwd) {
-  $item.Add_Click({
-    if (-not [WinFocus]::FocusByTitle($proj)) {
-      # Fallback: focus/open the REAL VS Code (never Cursor). Resolve the exe
-      # from the running Code process so `code` (= Cursor here) is bypassed.
-      $codeExe = (Get-Process -Name Code -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1).Path
-      if ($codeExe -and $cwd) { Start-Process $codeExe -ArgumentList ('"{0}"' -f $cwd) -ErrorAction SilentlyContinue }
-    }
-  }.GetNewClosure())
-}
-
+# The whole tray menu: open the desk, and quit. Nothing else by design.
 function Build-Menu {
   $menu.Items.Clear()
-  $now = Get-Date
-  $sessions = @()
-  if (Test-Path $stateDir) {
-    foreach ($f in Get-ChildItem $stateDir -Filter *.json -ErrorAction SilentlyContinue) {
-      try { $s = [System.IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json } catch { continue }
-      try { $upd = [datetime]$s.updated } catch { $upd = $f.LastWriteTime }
-      if (($now - $upd).TotalHours -gt 24) { Remove-Item $f.FullName -Force -EA SilentlyContinue; continue }
-      $st = [string]$s.status
-      if ($st -ne 'running' -and $st -ne 'waiting') { $st = 'done' }
-      $order = switch ($st) { 'waiting' { 0 } 'running' { 1 } default { 2 } }
-      $sessions += [pscustomobject]@{ s = $s; upd = $upd; st = $st; order = $order }
-    }
-  }
-  # Sort: waiting first, then running, then done; newest within each group.
-  $sessions = @($sessions | Sort-Object @{ Expression = 'order' }, @{ Expression = 'upd'; Descending = $true })
-
-  if ($sessions.Count -eq 0) {
-    $it = $menu.Items.Add('No active sessions')
-    $it.Enabled = $false
-  } else {
-    foreach ($e in $sessions) {
-      $s = $e.s
-      switch ($e.st) {
-        'running' { $dot = [char]0x25CF; $fc = [System.Drawing.Color]::FromArgb(80, 200, 120) }   # ●
-        'waiting' { $dot = [char]0x25CF; $fc = [System.Drawing.Color]::FromArgb(235, 150, 40) }    # ● (waiting)
-        default   { $dot = [char]0x25CB; $fc = [System.Drawing.Color]::DimGray }                   # ○
-      }
-      $p = [string]$s.last_prompt
-      if (-not $p) { $p = '(no prompt)' }
-      if ($p.Length -gt 64) { $p = $p.Substring(0, 64) + [char]0x2026 }
-      $mins = [int]($now - $e.upd).TotalMinutes
-      $age = if ($mins -lt 1) { "now" } elseif ($mins -lt 60) { "${mins}m" } else { "$([int]($mins/60))h" }
-      $it = New-Object System.Windows.Forms.ToolStripMenuItem
-      $sep = [char]0x2014   # em dash, built from code point (no non-ASCII literal in source)
-      $ctxStr = Format-Ctx $s
-      if ($ctxStr) { $it.Text = ('{0}  {1}   {2}   {3}   ({4})   {5} {6}' -f $dot, $s.project, $sep, $p, $age, [char]0x2022, $ctxStr) }
-      else         { $it.Text = ('{0}  {1}   {2}   {3}   ({4})' -f $dot, $s.project, $sep, $p, $age) }
-      $it.ForeColor = $fc
-      try { $it.Image = New-Swatch (Get-ProjectColor ([string]$s.project)) } catch {}   # per-project colour
-      Add-Click $it ([string]$s.project) ([string]$s.cwd)
-      [void]$menu.Items.Add($it)
-    }
-  }
-  [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-
-  # Prominent "install update" entry, shown only when a newer version was found.
-  $upd = Get-UpdateInfo
-  if ($upd) {
-    $ui = New-Object System.Windows.Forms.ToolStripMenuItem(("Install update (v{0})" -f $upd.latest))
-    $ui.ForeColor = [System.Drawing.Color]::FromArgb(80, 160, 90)
-    $ui.ToolTipText = "Downloads and runs the latest ClaudeDeck-Setup.cmd from GitHub"
-    $ui.Add_Click({ Invoke-Updater '-Apply' })
-    [void]$menu.Items.Add($ui)
-    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-  }
-
-  $dnd = New-Object System.Windows.Forms.ToolStripMenuItem('Do not disturb')
-  $dnd.Checked = (Test-Path $dndFlag)
-  $dnd.ToolTipText = "Suspends the auto-popup of the large view on task completion"
-  $dnd.Add_Click({
-    if (Test-Path $dndFlag) { Remove-Item $dndFlag -Force -ErrorAction SilentlyContinue }
-    else { Set-Content -LiteralPath $dndFlag -Value '' -Encoding ASCII }
-  })
-  [void]$menu.Items.Add($dnd)
-
-  $co = New-Object System.Windows.Forms.ToolStripMenuItem('Close on outside click')
-  $co.Checked = (Test-Path $closeFlag)
-  $co.ToolTipText = "Close the large view when clicking outside it (off by default)"
-  $co.Add_Click({
-    if (Test-Path $closeFlag) { Remove-Item $closeFlag -Force -ErrorAction SilentlyContinue }
-    else { Set-Content -LiteralPath $closeFlag -Value '' -Encoding ASCII }
-  })
-  [void]$menu.Items.Add($co)
-
-  # Transparency submenu — writes opacity % to opacity.txt (read live by the view).
-  $curOp = 92   # default: light transparency (Light)
-  try { if (Test-Path $opacityFile) { $curOp = [int]((Get-Content $opacityFile -Raw -ErrorAction Stop).Trim()) } } catch {}
-  $opMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Transparency')
-  $opMenu.ToolTipText = "Make the large view more or less transparent"
-  foreach ($lvl in @(
-      @{ v = 100; l = 'None (opaque)' },
-      @{ v = 92;  l = 'Light' },
-      @{ v = 80;  l = 'Medium' },
-      @{ v = 65;  l = 'Strong' })) {
-    $mi = New-Object System.Windows.Forms.ToolStripMenuItem($lvl.l)
-    $mi.Checked = ($curOp -eq $lvl.v)
-    $val = $lvl.v
-    $mi.Add_Click({ Set-Content -LiteralPath $opacityFile -Value $val -Encoding ASCII -ErrorAction SilentlyContinue }.GetNewClosure())
-    [void]$opMenu.DropDownItems.Add($mi)
-  }
-  [void]$menu.Items.Add($opMenu)
-
-  # Size submenu — writes a size value to size.txt (read live by the view). The view
-  # scales the WHOLE layout from it (width, fonts, badges, paddings) — not just width.
-  $curSize = 48
-  try { if (Test-Path $sizeFile) { $curSize = [int]((Get-Content $sizeFile -Raw -ErrorAction Stop).Trim()) } } catch {}
-  $szMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Size')
-  $szMenu.ToolTipText = "Overall size of the large view (scales everything together)"
-  foreach ($sz in @(
-      @{ v = 36; l = 'Compact' },
-      @{ v = 48; l = 'Normal' },
-      @{ v = 60; l = 'Large' })) {
-    $mi = New-Object System.Windows.Forms.ToolStripMenuItem($sz.l)
-    $mi.Checked = ($curSize -eq $sz.v)
-    $val = $sz.v
-    $mi.Add_Click({ Set-Content -LiteralPath $sizeFile -Value $val -Encoding ASCII -ErrorAction SilentlyContinue }.GetNewClosure())
-    [void]$szMenu.DropDownItems.Add($mi)
-  }
-  [void]$menu.Items.Add($szMenu)
-
-  [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
-
-  # Auto-update toggle (opt-in / off by default) + manual check.
-  $au = New-Object System.Windows.Forms.ToolStripMenuItem('Automatic updates')
-  $au.Checked = (Test-Path $autoUpdFlag)
-  $au.ToolTipText = "Periodically checks the GitHub repo and offers to install new versions"
-  $au.Add_Click({
-    if (Test-Path $autoUpdFlag) { Remove-Item $autoUpdFlag -Force -ErrorAction SilentlyContinue }
-    else { Set-Content -LiteralPath $autoUpdFlag -Value '' -Encoding ASCII; Invoke-Updater '-Check' }
-  })
-  [void]$menu.Items.Add($au)
-
-  $chk = $menu.Items.Add('Check for updates')
-  $chk.ToolTipText = "Check GitHub for a new version now"
-  $chk.Add_Click({ Invoke-Updater '-Check' })
-
-  $ver = Get-LocalVersion
-  if ($ver) {
-    $vi = $menu.Items.Add("ClaudeDeck v$ver")
-    $vi.Enabled = $false
-  }
-
-  [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
   $big = $menu.Items.Add('Show large view')
+  $big.ToolTipText = "Open the deck - sessions and all settings live there (also Win+Alt+C)"
   $big.Add_Click({
     $vbs = Join-Path $env:USERPROFILE '.claude\sessions\show-view.vbs'
     Start-Process wscript.exe -ArgumentList ('"{0}"' -f $vbs) -ErrorAction SilentlyContinue
   })
+
+  [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
   $quit = $menu.Items.Add('Quit')
+  $quit.ToolTipText = "Stop ClaudeDeck entirely (tray + desk)"
   $quit.Add_Click({ $notify.Visible = $false; [System.Windows.Forms.Application]::Exit() })
 }
 
-# Auto-update: an initial check shortly after start, then hourly (throttled to ~12h).
+# Background update check: an initial check shortly after start, then hourly
+# (throttled to ~12h inside Invoke-UpdateCheckThrottled).
 $updTimer = New-Object System.Windows.Forms.Timer
 $updTimer.Interval = 8000   # first tick ~8s after launch, then switches to hourly
 $updTimer.Add_Tick({

@@ -26,6 +26,12 @@ No Node, no Python, no dependencies — just PowerShell and a few Claude Code ho
 - **"Who just finished?" highlight** — when the overview pops up, the row of the session that just completed pulses green for a moment.
 - **Unopened-completion border** — a finished session you haven't opened yet gets a subtle blue outline; it clears the moment you click the row.
 
+### Track your activity
+
+- **Statistics dashboard** — a dark, 4K-friendly panel (tray menu → **Show statistics**) with three summary cards (**today**, **this week**, **streak**), a **14-day activity chart** (today's bar in green), and your **top projects this week** ranked by focus time, each with its project badge and a proportional bar.
+- **Focus time** — measured from each prompt to the matching completion, so you can see how long Claude actually worked, per day and per project.
+- **Private and local** — a tiny append-only log (`~/.claude/sessions/stats/events.jsonl`) populated by the same hooks; nothing leaves your machine, and entries older than 90 days are pruned automatically.
+
 ### Act fast
 
 - **Click to focus** — clicking a session brings its VS Code / Cursor window to the front, **without resizing or moving it**.

@@ -135,18 +135,133 @@ if (-not $mutexCreated) {
 
 $stateDir    = Join-Path $env:USERPROFILE '.claude\sessions\state'
 $closeFlag   = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'   # opt-in: close on outside click
-$posFile     = Join-Path $env:USERPROFILE '.claude\sessions\position.txt'        # top | center | bottom
+$dndFlag     = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'            # suspend auto-popup on completion
+$posFile     = Join-Path $env:USERPROFILE '.claude\sessions\position.txt'        # top | bottom
 $opacityFile = Join-Path $env:USERPROFILE '.claude\sessions\opacity.txt'         # 20..100 (window opacity %)
 $sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'            # 30..95 (overall scale; 55 = Normal/1.0, drives width + fonts)
 
+# --- Update / version files (shared with the tray) ---
+$autoUpdFlag = Join-Path $env:USERPROFILE '.claude\sessions\autoupdate.flag'
+$updInfoFile = Join-Path $env:USERPROFILE '.claude\sessions\update.json'
+$updScript   = Join-Path $env:USERPROFILE '.claude\sessions\session-update.ps1'
+$verFile     = Join-Path $env:USERPROFILE '.claude\sessions\version.txt'
+$statsVbs    = Join-Path $env:USERPROFILE '.claude\sessions\show-stats.vbs'
+
+function Get-LocalVersion {
+  try { if (Test-Path $verFile) { return ([System.IO.File]::ReadAllText($verFile)).Trim() } } catch {}
+  return $null
+}
+# Launch a version check / install in a hidden background process (never blocks the UI).
+function Invoke-Updater([string]$mode) {
+  if (-not (Test-Path $updScript)) { return }
+  Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $updScript), $mode
+  ) -ErrorAction SilentlyContinue
+}
+# Read the last check result -> the parsed object when an update is available, else $null.
+function Get-UpdateInfo {
+  try {
+    if (Test-Path $updInfoFile) {
+      $j = [System.IO.File]::ReadAllText($updInfoFile) | ConvertFrom-Json
+      if ($j.available) { return $j }
+    }
+  } catch {}
+  return $null
+}
+# Toggle a flag file on/off (used by the settings menu checkboxes).
+function Toggle-Flag([string]$path) {
+  if (Test-Path $path) { Remove-Item $path -Force -ErrorAction SilentlyContinue }
+  else { Set-Content -LiteralPath $path -Value '' -Encoding ASCII -ErrorAction SilentlyContinue }
+}
+
+# --- Favorite-workspace helpers --------------------------------------------
+# Run the shared helper as a hidden child process - NEVER dot-sourced. Dot-sourcing
+# a param()-block script into this WinForms scope leaked side effects that broke the
+# session list rendering. This mirrors Invoke-Updater above and keeps scopes clean.
+$wsHelper = Join-Path $PSScriptRoot 'session-workspaces.ps1'
+$wsFile   = Join-Path $env:USERPROFILE '.claude\sessions\workspaces.json'
+function Invoke-Workspaces([string]$mode) {
+  if (-not (Test-Path $wsHelper)) { return }
+  Start-Process powershell -WindowStyle Hidden -ArgumentList @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $wsHelper), $mode
+  ) -ErrorAction SilentlyContinue
+}
+# Count of saved favorites - read straight from workspaces.json (no helper needed).
+function Get-FavCount {
+  try { if (Test-Path $wsFile) { return @(([System.IO.File]::ReadAllText($wsFile) | ConvertFrom-Json).items).Count } } catch {}
+  return 0
+}
+
+# --- Google Material Icons -------------------------------------------------
+# We bundle MaterialIcons-Regular.ttf (Apache 2.0) next to this script and load
+# it privately (no system install). All deck glyphs — position, gear, close and
+# the per-session status dots — are drawn from it. If the font is missing we
+# fall back to Unicode glyphs in Segoe UI, so the deck still works.
+#   settings e8b8  close e5cd  vertical_align_top/bottom e25a/e258
+#   fiber_manual_record e061 (filled)  radio_button_unchecked e836 (outline)
+$script:MAT = @{ top=0xE25A; bottom=0xE258; settings=0xE8B8; close=0xE5CD;
+                 dotFull=0xE061; dotEmpty=0xE836 }
+$script:matPfc    = $null
+$script:matFamily = $null
+$matPath = Join-Path $PSScriptRoot 'MaterialIcons-Regular.ttf'
+if (Test-Path $matPath) {
+  try {
+    $script:matPfc = New-Object System.Drawing.Text.PrivateFontCollection
+    $script:matPfc.AddFontFile($matPath)
+    $script:matFamily = $script:matPfc.Families[0]
+  } catch { $script:matFamily = $null }
+}
+$script:iconFamily = if ($script:matFamily) { $script:matFamily } else { New-Object System.Drawing.FontFamily('Segoe UI') }
+
+# A label font for header icons (point-sized, so it scales with the layout).
+# UseCompatibleTextRendering=$true on the label routes through GDI+, which is
+# what makes the privately-loaded font actually render.
+function New-IconFont([single]$pt) {
+  New-Object System.Drawing.Font($script:iconFamily, $pt, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
+}
+# Fallback Unicode glyph for each Material codepoint (used when the font is absent).
+function Get-IconChar([int]$matCode, [int]$fallback) {
+  if ($script:matFamily) { return [string][char]$matCode }
+  return [string][char]$fallback
+}
+# Configure a header Label as an icon (Material codepoint or Unicode fallback).
+function Set-IconLabel($lbl, [int]$matCode, [int]$fallback, [single]$pt) {
+  $lbl.UseCompatibleTextRendering = $true
+  $lbl.Font = New-IconFont $pt
+  $lbl.Text = Get-IconChar $matCode $fallback
+}
+# Render a Material glyph to a transparent bitmap (used for the per-session
+# status dots, so a row can mix the dot's font with the prompt's font, and so
+# the "running" dot can be rotated). $px is the glyph size in pixels.
+function New-MatIcon([int]$matCode, [int]$fallback, [single]$px, $color, [single]$angle = 0) {
+  $box = [int][math]::Ceiling($px * 1.5)
+  $bmp = New-Object System.Drawing.Bitmap($box, $box)
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.SmoothingMode     = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+  $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+  $g.Clear([System.Drawing.Color]::Transparent)
+  if ($angle -ne 0) {
+    $g.TranslateTransform($box / 2.0, $box / 2.0)
+    $g.RotateTransform($angle)
+    $g.TranslateTransform(-$box / 2.0, -$box / 2.0)
+  }
+  $font = New-Object System.Drawing.Font($script:iconFamily, $px, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+  $br = New-Object System.Drawing.SolidBrush($color)
+  $sf = New-Object System.Drawing.StringFormat
+  $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
+  $g.DrawString((Get-IconChar $matCode $fallback), $font, $br, (New-Object System.Drawing.RectangleF(0, 0, $box, $box)), $sf)
+  $g.Dispose(); $br.Dispose(); $font.Dispose(); $sf.Dispose()
+  return $bmp
+}
+
 # Preferences (position + opacity + size) are re-read on every refresh so changes
 # from the tray menu apply live without reopening the view.
-$script:position = 'center'
+$script:position = 'top'
 $script:opacity  = 0.92          # default: light transparency (Light)
 $script:widthPct = 48            # default size = Normal (% of screen width)
 function Read-Prefs {
-  $script:position = 'center'
-  try { if (Test-Path $posFile) { $p = (Get-Content $posFile -Raw -ErrorAction Stop).Trim().ToLower(); if ($p -in @('top','center','bottom')) { $script:position = $p } } } catch {}
+  $script:position = 'top'
+  try { if (Test-Path $posFile) { $p = (Get-Content $posFile -Raw -ErrorAction Stop).Trim().ToLower(); if ($p -in @('top','bottom')) { $script:position = $p } } } catch {}
   $script:opacity = 0.92         # default: light transparency (Light)
   try { if (Test-Path $opacityFile) { $v = [int]((Get-Content $opacityFile -Raw -ErrorAction Stop).Trim()); if ($v -ge 20 -and $v -le 100) { $script:opacity = $v / 100.0 } } } catch {}
   $script:widthPct = 48          # default size = Normal
@@ -175,6 +290,8 @@ function Compute-Dims {
   $script:rowH      = [int]($script:rowPt * 3.4)
   $script:rowMargin = [int][math]::Max(4, 10 * $script:scale)
   $script:badgeSize = [int]($script:rowPt * 2.0)
+  $script:statPx    = [single]([math]::Max(11, $script:rowPt * 1.25))           # status-dot glyph size (px)
+  $script:statBox   = [int][math]::Ceiling($script:statPx * 1.5)                # bitmap box (matches New-MatIcon)
   $script:listPadX  = [int][math]::Max(8, 16 * $script:scale)
   $script:listPadY  = [int][math]::Max(6, 12 * $script:scale)
   $script:listPadV  = $script:listPadY * 2
@@ -273,6 +390,21 @@ function Set-Seen($sid) {
     }
   } catch {}
 }
+# Dismiss a session from the list by stamping its CURRENT 'updated' value into a
+# 'dismissed' field. The list hides the row while dismissed == updated; any new
+# activity (prompt/stop/notify) rewrites 'updated' to a fresh timestamp, so the
+# two no longer match and the row reappears on its own. No tracker change needed.
+function Set-Dismissed($sid) {
+  try {
+    $f = Join-Path $stateDir ($sid + '.json')
+    if (Test-Path $f) {
+      $o = [System.IO.File]::ReadAllText($f) | ConvertFrom-Json
+      $stamp = [string]$o.updated
+      if ($o.PSObject.Properties.Name -contains 'dismissed') { $o.dismissed = $stamp } else { $o | Add-Member -NotePropertyName dismissed -NotePropertyValue $stamp }
+      [System.IO.File]::WriteAllText($f, ($o | ConvertTo-Json -Depth 5), (New-Object System.Text.UTF8Encoding($false)))
+    }
+  } catch {}
+}
 
 $form = New-Object System.Windows.Forms.Form
 $form.FormBorderStyle = 'None'
@@ -310,11 +442,10 @@ $title.AutoSize = $true
 $title.Location = New-Object System.Drawing.Point(24, [int](($headerH - $title.PreferredHeight) / 2))
 $header.Controls.Add($title)
 
-# Close button (X) — top-right corner
+# Close button (X) — top-right corner — Material "close" glyph
 $close = New-Object System.Windows.Forms.Label
-$close.Text = [char]0x2715   # heavy multiplication X
+Set-IconLabel $close $script:MAT.close 0x2715 ([single]($titlePt * 0.92))
 $close.ForeColor = $grey
-$close.Font = New-Object System.Drawing.Font('Segoe UI', $titlePt, [System.Drawing.FontStyle]::Bold)
 $close.AutoSize = $true
 $close.Cursor = [System.Windows.Forms.Cursors]::Hand
 $close.Add_MouseEnter({ $close.ForeColor = [System.Drawing.Color]::FromArgb(240, 90, 90) })
@@ -324,25 +455,173 @@ $header.Controls.Add($close)
 
 # --- Position buttons (▲ top, ▬ middle, ▼ bottom) — to the left of X ---
 $posTip = New-Object System.Windows.Forms.ToolTip
-function New-PosButton($glyph, $tip) {
+function New-PosButton($matCode, $fallback, $tip) {
   $b = New-Object System.Windows.Forms.Label
-  $b.Text = $glyph
+  Set-IconLabel $b $matCode $fallback ([single]($posPt * 1.15))
   $b.ForeColor = $grey
-  $b.Font = New-Object System.Drawing.Font('Segoe UI', $posPt, [System.Drawing.FontStyle]::Bold)
   $b.AutoSize = $true
   $b.Cursor = [System.Windows.Forms.Cursors]::Hand
   $posTip.SetToolTip($b, $tip)
   $header.Controls.Add($b)
   return $b
 }
-$script:posTop = New-PosButton ([char]0x25B2) 'Position: top'
-$script:posMid = New-PosButton ([char]0x25AC) 'Position: center'
-$script:posBot = New-PosButton ([char]0x25BC) 'Position: bottom'
+$script:posTop = New-PosButton $script:MAT.top    0x25B2 'Position: top'
+$script:posBot = New-PosButton $script:MAT.bottom 0x25BC 'Position: bottom'
+
+# --- Settings gear (⚙) — opens the full menu, mirroring the tray. So every
+# option is reachable straight from the on-screen deck, not just the taskbar.
+$script:gear = New-Object System.Windows.Forms.Label
+Set-IconLabel $script:gear $script:MAT.settings 0x2699 ([single]($posPt * 1.15))
+$script:gear.ForeColor = $grey
+$script:gear.AutoSize = $true
+$script:gear.Cursor = [System.Windows.Forms.Cursors]::Hand
+$posTip.SetToolTip($script:gear, 'Settings')
+$script:gear.Add_MouseEnter({ $script:gear.ForeColor = [System.Drawing.Color]::FromArgb(120, 175, 240) })
+$script:gear.Add_MouseLeave({ $script:gear.ForeColor = $grey })
+$header.Controls.Add($script:gear)
+
+# The settings menu (rebuilt on every open so checkmarks reflect current state).
+$script:settingsMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$script:menuOpen = $false
+$script:settingsMenu.Add_Opening({ $script:menuOpen = $true })   # suppress click-outside-close while open
+$script:settingsMenu.Add_Closed({ $script:menuOpen = $false; $script:shownAt = [Environment]::TickCount })
+
+function Build-SettingsMenu {
+  $m = $script:settingsMenu
+  $m.Items.Clear()
+
+  # Prominent "install update" entry, shown only when a newer version was found.
+  $upd = Get-UpdateInfo
+  if ($upd) {
+    $ui = New-Object System.Windows.Forms.ToolStripMenuItem(("Install update (v{0})" -f $upd.latest))
+    $ui.ForeColor = [System.Drawing.Color]::FromArgb(80, 160, 90)
+    $ui.ToolTipText = "Downloads and runs the latest ClaudeDeck-Setup.cmd from GitHub"
+    $ui.Add_Click({ Invoke-Updater '-Apply' })
+    [void]$m.Items.Add($ui)
+    [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+  }
+
+  $dnd = New-Object System.Windows.Forms.ToolStripMenuItem('Do not disturb')
+  $dnd.Checked = (Test-Path $dndFlag)
+  $dnd.ToolTipText = "Suspends the auto-popup of the large view on task completion"
+  $dnd.Add_Click({ Toggle-Flag $dndFlag })
+  [void]$m.Items.Add($dnd)
+
+  $co = New-Object System.Windows.Forms.ToolStripMenuItem('Close on outside click')
+  $co.Checked = (Test-Path $closeFlag)
+  $co.ToolTipText = "Close this view when clicking outside it (off by default)"
+  $co.Add_Click({ Toggle-Flag $closeFlag })
+  [void]$m.Items.Add($co)
+
+  # Transparency submenu — writes opacity % (re-read live on the next refresh).
+  $curOp = [int]([math]::Round($script:opacity * 100))
+  $opMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Transparency')
+  $opMenu.ToolTipText = "Make this view more or less transparent"
+  foreach ($lvl in @(
+      @{ v = 100; l = 'None (opaque)' },
+      @{ v = 92;  l = 'Light' },
+      @{ v = 80;  l = 'Medium' },
+      @{ v = 65;  l = 'Strong' })) {
+    $mi = New-Object System.Windows.Forms.ToolStripMenuItem($lvl.l)
+    $mi.Checked = ($curOp -eq $lvl.v)
+    $val = $lvl.v
+    $mi.Add_Click({ Set-Content -LiteralPath $opacityFile -Value $val -Encoding ASCII -ErrorAction SilentlyContinue }.GetNewClosure())
+    [void]$opMenu.DropDownItems.Add($mi)
+  }
+  [void]$m.Items.Add($opMenu)
+
+  # Size submenu — writes a size value (the view rescales the WHOLE layout live).
+  $curSize = $script:widthPct
+  $szMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Size')
+  $szMenu.ToolTipText = "Overall size of this view (scales everything together)"
+  foreach ($sz in @(
+      @{ v = 36; l = 'Compact' },
+      @{ v = 48; l = 'Normal' },
+      @{ v = 60; l = 'Large' })) {
+    $mi = New-Object System.Windows.Forms.ToolStripMenuItem($sz.l)
+    $mi.Checked = ($curSize -eq $sz.v)
+    $val = $sz.v
+    $mi.Add_Click({ Set-Content -LiteralPath $sizeFile -Value $val -Encoding ASCII -ErrorAction SilentlyContinue }.GetNewClosure())
+    [void]$szMenu.DropDownItems.Add($mi)
+  }
+  [void]$m.Items.Add($szMenu)
+
+  [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+  # Favorite workspaces - a fully manual pair. "Save" snapshots the VS Code /
+  # Cursor windows open right now into workspaces.json; "Reopen" relaunches them
+  # all in one click (survives a Windows restart). Closing/opening windows in
+  # between changes nothing until you click Save again.
+  $wsN = Get-FavCount
+
+  $wsSave = New-Object System.Windows.Forms.ToolStripMenuItem('Save open workspaces as favorites')
+  $wsSave.ToolTipText = "Remember the VS Code / Cursor windows open right now (overwrites the previous set)"
+  $wsSave.Add_Click({ Invoke-Workspaces '-Save' })
+  [void]$m.Items.Add($wsSave)
+
+  $wsReTxt = if ($wsN -gt 0) { "Reopen favorite workspaces ($wsN)" } else { 'Reopen favorite workspaces' }
+  $wsRe = New-Object System.Windows.Forms.ToolStripMenuItem($wsReTxt)
+  $wsRe.ToolTipText = "Relaunch the workspaces saved as favorites"
+  $wsRe.Enabled = ($wsN -gt 0)
+  $wsRe.Add_Click({ Invoke-Workspaces '-Restore' })
+  [void]$m.Items.Add($wsRe)
+
+  [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+  # Auto-update toggle (opt-in / off by default) + manual check.
+  $au = New-Object System.Windows.Forms.ToolStripMenuItem('Automatic updates')
+  $au.Checked = (Test-Path $autoUpdFlag)
+  $au.ToolTipText = "Periodically checks the GitHub repo and offers to install new versions"
+  $au.Add_Click({
+    if (Test-Path $autoUpdFlag) { Remove-Item $autoUpdFlag -Force -ErrorAction SilentlyContinue }
+    else { Set-Content -LiteralPath $autoUpdFlag -Value '' -Encoding ASCII; Invoke-Updater '-Check' }
+  })
+  [void]$m.Items.Add($au)
+
+  $chk = New-Object System.Windows.Forms.ToolStripMenuItem('Check for updates')
+  $chk.ToolTipText = "Check GitHub for a new version now"
+  $chk.Add_Click({ Invoke-Updater '-Check' })
+  [void]$m.Items.Add($chk)
+
+  $ver = Get-LocalVersion
+  if ($ver) {
+    $vi = New-Object System.Windows.Forms.ToolStripMenuItem("ClaudeDeck v$ver")
+    $vi.Enabled = $false
+    [void]$m.Items.Add($vi)
+  }
+
+  [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+  $stats = New-Object System.Windows.Forms.ToolStripMenuItem('Show statistics')
+  $stats.ToolTipText = "Open the statistics dashboard (activity, focus time, top projects)"
+  $stats.Add_Click({ Start-Process wscript.exe -ArgumentList ('"{0}"' -f $statsVbs) -ErrorAction SilentlyContinue })
+  [void]$m.Items.Add($stats)
+
+  $hide = New-Object System.Windows.Forms.ToolStripMenuItem('Hide this view')
+  $hide.ToolTipText = "Close the view (the tray keeps running; reopen with Win+Alt+C)"
+  $hide.Add_Click({ $form.Close() })
+  [void]$m.Items.Add($hide)
+
+  $quit = New-Object System.Windows.Forms.ToolStripMenuItem('Quit ClaudeDeck')
+  $quit.ToolTipText = "Close the view AND stop the tray (quits ClaudeDeck entirely)"
+  $quit.Add_Click({
+    # Stop the tray process, then close this view.
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+      Where-Object { $_.CommandLine -like '*session-tray.ps1*' } |
+      ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    $form.Close()
+  })
+  [void]$m.Items.Add($quit)
+}
+
+$script:gear.Add_Click({
+  Build-SettingsMenu
+  $script:settingsMenu.Show($script:gear, (New-Object System.Drawing.Point(0, $script:gear.Height)))
+})
 
 # Highlight the active position; the others stay dim.
 function Update-PosHighlight {
   $script:posTop.ForeColor = if ($script:position -eq 'top')    { $white } else { $grey }
-  $script:posMid.ForeColor = if ($script:position -eq 'center') { $white } else { $grey }
   $script:posBot.ForeColor = if ($script:position -eq 'bottom') { $white } else { $grey }
 }
 function Set-Position($pos) {
@@ -352,29 +631,28 @@ function Set-Position($pos) {
   Update-PosHighlight
 }
 $script:posTop.Add_Click({ Set-Position 'top' })
-$script:posMid.Add_Click({ Set-Position 'center' })
 $script:posBot.Add_Click({ Set-Position 'bottom' })
-foreach ($pb in @($script:posTop, $script:posMid, $script:posBot)) {
+foreach ($pb in @($script:posTop, $script:posBot)) {
   $pb.Add_MouseEnter({ $this.ForeColor = [System.Drawing.Color]::FromArgb(120, 175, 240) }.GetNewClosure())
   $pb.Add_MouseLeave({ Update-PosHighlight }.GetNewClosure())
 }
 Update-PosHighlight
 
 $hint = New-Object System.Windows.Forms.Label
-$hint.Text = 'Esc to close'
+$hint.Text = ''
 $hint.ForeColor = $grey
 $hint.Font = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.7))
 $hint.AutoSize = $true
 $header.Controls.Add($hint)
 
-# Keep X, the position buttons and the hint pinned to the right edge.
-# Layout from the right:  [hint]  ▲ ▬ ▼   ✕
+# Keep X, the gear, the position buttons and the hint pinned to the right edge.
+# Layout from the right:  [hint]  ▲ ▼   ⚙   ✕
 function Layout-Header {
   $cy = { param($c) [int](($script:headerH - $c.Height) / 2) }
   $x  = $header.Width - 20
   $x -= $close.Width;                $close.Location         = New-Object System.Drawing.Point($x, (& $cy $close))
+  $x -= ($script:gear.Width + 18);   $script:gear.Location   = New-Object System.Drawing.Point($x, (& $cy $script:gear))
   $x -= ($script:posBot.Width + 18); $script:posBot.Location = New-Object System.Drawing.Point($x, (& $cy $script:posBot))
-  $x -= ($script:posMid.Width + 10); $script:posMid.Location = New-Object System.Drawing.Point($x, (& $cy $script:posMid))
   $x -= ($script:posTop.Width + 10); $script:posTop.Location = New-Object System.Drawing.Point($x, (& $cy $script:posTop))
   $x -= ($hint.Width + 24);          $hint.Location          = New-Object System.Drawing.Point($x, (& $cy $hint))
 }
@@ -386,10 +664,11 @@ function Restyle {
   $header.Height  = $script:headerH
   $title.Font     = New-Object System.Drawing.Font('Segoe UI', $script:titlePt, [System.Drawing.FontStyle]::Bold)
   $title.Location = New-Object System.Drawing.Point(24, [int](($script:headerH - $title.PreferredHeight) / 2))
-  $close.Font     = New-Object System.Drawing.Font('Segoe UI', $script:titlePt, [System.Drawing.FontStyle]::Bold)
-  foreach ($pb in @($script:posTop, $script:posMid, $script:posBot)) {
-    $pb.Font = New-Object System.Drawing.Font('Segoe UI', $script:posPt, [System.Drawing.FontStyle]::Bold)
+  $close.Font     = New-IconFont ([single]($script:titlePt * 0.92))
+  foreach ($pb in @($script:posTop, $script:posBot)) {
+    $pb.Font = New-IconFont ([single]($script:posPt * 1.15))
   }
+  $script:gear.Font = New-IconFont ([single]($script:posPt * 1.15))
   $hint.Font    = New-Object System.Drawing.Font('Segoe UI', [single]($script:rowPt * 0.7))
   $list.Padding = New-Object System.Windows.Forms.Padding($script:listPadX, $script:listPadY, $script:listPadX, $script:listPadY)
   Layout-Header
@@ -407,10 +686,10 @@ $dbProp.SetValue($list, $true, $null)   # double-buffer the list too
 $form.Controls.Add($list)
 $list.BringToFront()
 
-# $rowH, $rowMargin and $badgeSize are computed in Compute-Dims (scale-aware).
+# $rowH, $rowMargin, $badgeSize, $statPx, $statBox are computed in Compute-Dims.
 
-# Spinner frames for "running" (a rotating half-disc) — animated by $spinTimer.
-$script:spinFrames = @([char]0x25D0, [char]0x25D3, [char]0x25D1, [char]0x25D2)   # ◐ ◓ ◑ ◒
+# Tooltip shared by every row's ✕ (hide) button.
+$script:rowTip = New-Object System.Windows.Forms.ToolTip
 
 function Make-Row($s, $status, $seen, $promptText, $age) {
   $btn = New-Object System.Windows.Forms.Button
@@ -424,10 +703,12 @@ function Make-Row($s, $status, $seen, $promptText, $age) {
   } else {
     $btn.FlatAppearance.BorderSize = 0
   }
+  # Status dot is a Material glyph (own font), so it lives in its own Label to the
+  # left of the project badge — the row text stays in Segoe UI.
   switch ($status) {
-    'running' { $fc = $green;  $glyph = $script:spinFrames[0] }   # rotating disc (animated)
-    'waiting' { $fc = $orange; $glyph = [char]0x25CF }            # ●
-    default   { $fc = $grey;   $glyph = [char]0x25CB }            # ○
+    'running' { $fc = $green;  $statCode = $script:MAT.dotFull;  $statFb = 0x25CF }  # filled circle (blinks)
+    'waiting' { $fc = $orange; $statCode = $script:MAT.dotFull;  $statFb = 0x25CF }  # filled circle
+    default   { $fc = $grey;   $statCode = $script:MAT.dotEmpty; $statFb = 0x25CB }  # outlined circle
   }
   $btn.ForeColor = $fc
   $btn.Font = New-Object System.Drawing.Font('Segoe UI', $rowPt)
@@ -435,7 +716,8 @@ function Make-Row($s, $status, $seen, $promptText, $age) {
   $btn.TextImageRelation = 'ImageBeforeText'
   $btn.ImageAlign = 'MiddleLeft'
   $btn.Image = New-Badge ([string]$s.project) $badgeSize   # coloured square + initials
-  $btn.Padding = New-Object System.Windows.Forms.Padding(14, 0, 18, 0)
+  $statGap = 12
+  $btn.Padding = New-Object System.Windows.Forms.Padding(($script:statBox + $statGap), 0, 18, 0)  # leave room for the status dot
   $btn.Width  = $list.ClientSize.Width - ($script:listPadX * 2 + 8)
   $btn.Height = $rowH
   $btn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, $rowMargin)
@@ -443,12 +725,51 @@ function Make-Row($s, $status, $seen, $promptText, $age) {
   $sep = [char]0x2014
   $rest = ('  {0}    {1}    {2}    ({3})' -f $s.project, $sep, $promptText, $age)
   $btn.AutoEllipsis = $true                          # truncate with "…" instead of wrapping to a 2nd line
-  $btn.Text = '  ' + $glyph + $rest
-  if ($status -eq 'running') { $btn.Tag = $rest }   # spinner timer rewrites: '  ' + frame + Tag
-  $btn.Add_Disposed({ param($snd, $e) try { if ($snd.Image) { $snd.Image.Dispose() } } catch {} })
+  $btn.Text = $rest
+
+  # Status dot (Material glyph rendered to a bitmap), pinned at the left edge.
+  $statLbl = New-Object System.Windows.Forms.Label
+  $statLbl.AutoSize  = $false
+  $statLbl.Size      = New-Object System.Drawing.Size($script:statBox, $script:statBox)
+  $statLbl.BackColor = [System.Drawing.Color]::Transparent
+  $statLbl.Cursor    = [System.Windows.Forms.Cursors]::Hand
+  $statLbl.Image     = New-MatIcon $statCode $statFb $script:statPx $fc
+  $statLbl.Location  = New-Object System.Drawing.Point(8, [int](($btn.Height - $script:statBox) / 2))
+  $btn.Controls.Add($statLbl)
+  $statLbl.BringToFront()
+  $btn.Tag = $statLbl                                # spinner timer rotates running rows' status dot
+  # Dispose every image this row owns (badge + status dot) when the row goes away.
+  $btn.Add_Disposed({ param($snd, $e)
+    try { if ($snd.Image) { $snd.Image.Dispose() } } catch {}
+    try { foreach ($cc in $snd.Controls) { if ($cc.Image) { $cc.Image.Dispose() } } } catch {}
+  })
+
+  # Hide (✕) button — pinned to the FAR right of the row. Dismisses this session
+  # from the list (Set-Dismissed); it reappears on the session's next activity.
+  # It lives in its own Label so its click never triggers the row's focus action.
+  $closeLbl = New-Object System.Windows.Forms.Label
+  $closeLbl.UseCompatibleTextRendering = $true
+  $closeLbl.Font      = New-IconFont ([single]($rowPt * 0.85))
+  $closeLbl.Text      = Get-IconChar $script:MAT.close 0x2715
+  $closeLbl.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 120)
+  $closeLbl.BackColor = [System.Drawing.Color]::Transparent
+  $closeLbl.AutoSize  = $true
+  $closeLbl.Cursor    = [System.Windows.Forms.Cursors]::Hand
+  $closeLbl.Anchor    = 'Top, Right'
+  $script:rowTip.SetToolTip($closeLbl, 'Hide this session (reappears on its next activity)')
+  $closeRight = 14
+  $closeLbl.Location = New-Object System.Drawing.Point(
+    ($btn.Width - $closeLbl.PreferredWidth - $closeRight),
+    [int](($btn.Height - $closeLbl.PreferredHeight) / 2))
+  $btn.Controls.Add($closeLbl)
+  $closeLbl.BringToFront()
+  $closeLbl.Add_MouseEnter({ $this.ForeColor = [System.Drawing.Color]::FromArgb(240, 90, 90) })
+  $closeLbl.Add_MouseLeave({ $this.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 120) })
+  $closeSlot = $closeLbl.PreferredWidth + $closeRight + 10   # room the ✕ occupies on the right
 
   # Context size lives in its OWN slot pinned to the right edge — never part of the
   # row text, so a long prompt can't push it onto a second line (the text ellipsizes).
+  # Sits just left of the ✕ button.
   $ctxLbl = $null
   $ctxStr = Format-Ctx $s
   if ($ctxStr) {
@@ -459,15 +780,17 @@ function Make-Row($s, $status, $seen, $promptText, $age) {
     $ctxLbl.BackColor = [System.Drawing.Color]::Transparent  # let the row bg (breathe/flash) show through
     $ctxLbl.AutoSize  = $true
     $ctxLbl.Cursor    = [System.Windows.Forms.Cursors]::Hand
-    $ctxRight = 18
+    $ctxRight = $closeSlot + 4
     $ctxLbl.Anchor   = 'Top, Right'
     $ctxLbl.Location = New-Object System.Drawing.Point(
       ($btn.Width - $ctxLbl.PreferredWidth - $ctxRight),
       [int](($btn.Height - $ctxLbl.PreferredHeight) / 2))
     $btn.Controls.Add($ctxLbl)
-    # Reserve room on the right so the ellipsized text never runs under the ctx slot.
-    $btn.Padding = New-Object System.Windows.Forms.Padding(14, 0, ($ctxLbl.PreferredWidth + $ctxRight + 12), 0)
   }
+  # Reserve room on the right for the ✕ (+ ctx slot when present), but KEEP the
+  # left room for the status dot (else the project badge slides over it).
+  $rightPad = if ($ctxLbl) { $ctxLbl.PreferredWidth + $ctxRight + 12 } else { $closeSlot + 12 }
+  $btn.Padding = New-Object System.Windows.Forms.Padding(($script:statBox + $statGap), 0, $rightPad, 0)
 
   $proj = [string]$s.project
   $cwd  = [string]$s.cwd
@@ -481,7 +804,10 @@ function Make-Row($s, $status, $seen, $promptText, $age) {
     }
   }.GetNewClosure()
   $btn.Add_Click($clickHandler)
+  $statLbl.Add_Click($clickHandler)                   # the status dot is part of the clickable row
   if ($ctxLbl) { $ctxLbl.Add_Click($clickHandler) }   # the ctx slot is part of the clickable row
+  # ✕ dismisses the session and refreshes immediately (don't focus the IDE).
+  $closeLbl.Add_Click({ Set-Dismissed $sid; $script:lastSig = $null; Refresh-List }.GetNewClosure())
   return $btn
 }
 
@@ -525,15 +851,20 @@ $animTimer.Add_Tick({
   if ((@($script:waitBtns).Count -eq 0) -and (-not $script:flashBtn)) { $animTimer.Stop() }
 })
 
-# Spinner: rotate the glyph on every running row (so it visibly "turns").
-$script:spinBtns = @()
+# Running rows: the green dot blinks (smooth alpha pulse) — no rotation.
+$script:spinLbls = @()   # status Labels of the running rows
 $spinTimer = New-Object System.Windows.Forms.Timer
-$spinTimer.Interval = 110
+$spinTimer.Interval = 60
 $spinTimer.Add_Tick({
-  if (@($script:spinBtns).Count -eq 0) { $spinTimer.Stop(); return }
-  $f = $script:spinFrames[ [int]([Environment]::TickCount / 110) % $script:spinFrames.Count ]
-  foreach ($b in @($script:spinBtns)) {
-    try { $b.Text = '  ' + $f + [string]$b.Tag } catch {}
+  if (@($script:spinLbls).Count -eq 0) { $spinTimer.Stop(); return }
+  $k = 0.5 - 0.5 * [math]::Cos(([Environment]::TickCount / 750.0) * 2 * [math]::PI)   # 0..1
+  $col = [System.Drawing.Color]::FromArgb([int](80 + 175 * $k), $green.R, $green.G, $green.B)
+  foreach ($l in @($script:spinLbls)) {
+    try {
+      $old = $l.Image
+      $l.Image = New-MatIcon $script:MAT.dotFull 0x25CF $script:statPx $col
+      if ($old) { $old.Dispose() }
+    } catch {}
   }
 })
 
@@ -563,6 +894,8 @@ function Refresh-List {
       try { $s = [System.IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json } catch { continue }
       try { $upd = [datetime]$s.updated } catch { $upd = $f.LastWriteTime }
       if (($now - $upd).TotalHours -gt 24) { continue }
+      # Hidden via the row's ✕ — stays out until its next activity bumps 'updated'.
+      if ($s.dismissed -and ([string]$s.dismissed -eq [string]$s.updated)) { continue }
       $sessions += [pscustomobject]@{ s = $s; upd = $upd }
     }
   }
@@ -601,7 +934,7 @@ function Refresh-List {
   # Buttons are about to be recreated; reset animation targets.
   $animTimer.Stop(); $spinTimer.Stop()
   $script:waitBtns = @()
-  $script:spinBtns = @()
+  $script:spinLbls = @()
   $script:flashBtn = $null
 
   $list.SuspendLayout()
@@ -621,7 +954,7 @@ function Refresh-List {
       $b = Make-Row $r.s $r.status $r.seen $r.p $r.age
       $list.Controls.Add($b)
       if ($r.status -eq 'waiting') { $waiting += $b }
-      if ($r.status -eq 'running') { $spinning += $b }
+      if ($r.status -eq 'running') { $spinning += $b.Tag }   # $b.Tag = the row's status Label
       if ($triggerSid -and ([string]$r.s.session_id -eq $triggerSid)) { $triggerBtn = $b }
     }
   }
@@ -642,7 +975,7 @@ function Refresh-List {
 
   # Drive animations: running rows spin; waiting rows breathe; a NEW completion flashes once.
   $script:waitBtns = $waiting
-  $script:spinBtns = $spinning
+  $script:spinLbls = $spinning
   if ($triggerKey -and ($triggerKey -ne $script:lastAnimKey)) {
     $script:lastAnimKey = $triggerKey
     $script:flashBtn    = $triggerBtn
@@ -650,7 +983,7 @@ function Refresh-List {
     $script:shownAt     = [Environment]::TickCount   # re-arm the click-outside grace on a fresh pop
   }
   if ((@($script:waitBtns).Count -gt 0) -or $script:flashBtn) { $animTimer.Start() }
-  if (@($script:spinBtns).Count -gt 0) { $spinTimer.Start() }
+  if (@($script:spinLbls).Count -gt 0) { $spinTimer.Start() }
 }
 
 $timer = New-Object System.Windows.Forms.Timer
@@ -677,7 +1010,7 @@ $clickTimer = New-Object System.Windows.Forms.Timer
 $clickTimer.Interval = 50
 $clickTimer.Add_Tick({
   $down = [WinFocus]::AnyMouseDown()
-  if ($down -and -not $script:prevDown -and (([Environment]::TickCount - $script:shownAt) -ge 500) -and (Test-Path $closeFlag)) {
+  if ($down -and -not $script:prevDown -and -not $script:menuOpen -and (([Environment]::TickCount - $script:shownAt) -ge 500) -and (Test-Path $closeFlag)) {
     $b = $form.Bounds
     if ([WinFocus]::CursorOutside($b.Left, $b.Top, $b.Right, $b.Bottom)) { $form.Close() }
   }

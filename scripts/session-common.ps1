@@ -42,6 +42,13 @@ function Toggle-Flag([string]$path) {
   else { Set-Content -LiteralPath $path -Value '' -Encoding ASCII -ErrorAction SilentlyContinue }
 }
 
+# --- ClaudeDeck brand accent ------------------------------------------------
+# The single terracotta-orange that brands the deck: the collapsed strip, the
+# "Claude Code Sessions" title and the focus-nudge Matrix rain all derive from
+# this one value. Change it here and every surface follows. (Returns a Color, so
+# the caller must have loaded System.Drawing - every consumer does.)
+function Get-CDAccent { return [System.Drawing.Color]::FromArgb(204, 115, 81) }
+
 # --- Per-project accent colour + initials badge ----------------------------
 # Stable hash of the project name -> hue, so the same project always gets the same
 # colour in both the deck and the stats dashboard.

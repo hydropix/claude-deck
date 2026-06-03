@@ -321,15 +321,17 @@ $white  = [System.Drawing.Color]::FromArgb(235, 235, 240)
 $unseen = [System.Drawing.Color]::FromArgb(150, 175, 220)   # border: finished & not yet opened
 
 # Header chrome colours. The deck normally wears a near-black header; collapsed it
-# turns into a warm orange strip with dark text/icons (so it reads as "tucked away
-# but here"). $script:hdrFg / $script:hdrTitle are the LIVE resting colours the
+# turns into a warm orange strip (so it reads as "tucked away but here"): the title
+# goes white and the chrome/Pomodoro use dark, high-contrast tones that stay legible
+# on the orange. $script:hdrFg / $script:hdrTitle are the LIVE resting colours the
 # header's hover handlers fall back to, swapped by Set-Collapsed.
 $script:headerBg    = [System.Drawing.Color]::FromArgb(18, 18, 22)
-$script:collapsedBg = [System.Drawing.Color]::FromArgb(232, 145, 40)   # orange strip
-$hdrDark            = [System.Drawing.Color]::FromArgb(40, 24, 4)       # icons on orange
-$hdrDarkTitle       = [System.Drawing.Color]::FromArgb(28, 16, 2)       # title on orange
+$script:collapsedBg = Get-CDAccent                                     # brand orange strip
+$hdrDark            = [System.Drawing.Color]::FromArgb(40, 24, 4)       # chrome/Pomodoro icons on orange
+$dimOnOrange        = [System.Drawing.Color]::FromArgb(64, 38, 16)      # muted/idle text on the orange strip
 $script:hdrFg       = $grey    # resting icon colour (grey expanded, dark collapsed)
-$script:hdrTitle    = $white   # title colour       (white expanded, dark collapsed)
+$script:hdrTitle    = Get-CDAccent  # title colour    (orange expanded, white collapsed)
+$script:pomoIconRest = $grey   # Pomodoro control rest colour (grey expanded, dark on orange collapsed)
 
 # The per-project accent colour / initials / contrasting text helpers
 # (Get-ProjectColor / Get-Initials / Get-TextOn) live in session-common.ps1.
@@ -399,7 +401,7 @@ $form.Controls.Add($header)
 
 $title = New-Object System.Windows.Forms.Label
 $title.Text = 'Claude Code Sessions'
-$title.ForeColor = $white
+$title.ForeColor = Get-CDAccent
 $title.Font = New-Object System.Drawing.Font('Segoe UI', $titlePt, [System.Drawing.FontStyle]::Bold)
 $title.AutoSize = $true
 $title.Location = New-Object System.Drawing.Point(24, [int](($headerH - $title.PreferredHeight) / 2))
@@ -477,10 +479,12 @@ function New-PomoIcon($matCode, $fallback, $tip) {
   $b.AutoSize = $true
   $b.Cursor = [System.Windows.Forms.Cursors]::Hand
   $posTip.SetToolTip($b, $tip)
-  # Literal colours here: $white/$grey aren't in this function's local scope, so
-  # GetNewClosure would capture them as null (matches the posTop/gear handlers).
+  # Hover is always near-white (legible on both the dark header and the orange
+  # strip); the resting colour follows $script:pomoIconRest, swapped by Set-Collapsed
+  # (grey on the dark header, dark on the orange strip). Script-scoped vars are read
+  # directly in the handler - no GetNewClosure (which would capture locals as null).
   $b.Add_MouseEnter({ $this.ForeColor = [System.Drawing.Color]::FromArgb(235, 235, 240) })
-  $b.Add_MouseLeave({ $this.ForeColor = [System.Drawing.Color]::FromArgb(150, 150, 158) })
+  $b.Add_MouseLeave({ $this.ForeColor = $script:pomoIconRest })
   $header.Controls.Add($b)
   return $b
 }
@@ -537,8 +541,12 @@ function Render-Pomo {
     $completed = [int]$o.completed
   }
   $mm = [int][math]::Floor($remaining / 60); $ss = [int]($remaining % 60)
+  # On the orange strip everything must read against the warm background: white when
+  # the clock runs (pops like the title), a muted dark when idle. On the dark header
+  # it keeps the usual white/grey.
+  $onOrange = $script:collapsed
   $script:pomoTime.Text = ('{0:00}:{1:00}' -f $mm, $ss)
-  $script:pomoTime.ForeColor = if ($running) { $white } else { $grey }
+  $script:pomoTime.ForeColor = if ($running) { $white } elseif ($onOrange) { $dimOnOrange } else { $grey }
 
   # Play when paused, pause when running.
   if ($running) { $script:pomoToggle.Text = Get-IconChar $script:MAT.pause 0x23F8 }
@@ -551,7 +559,18 @@ function Render-Pomo {
   if (-not $status) { $status = 'Ready' }
   if ($status.Length -gt 26) { $status = $status.Substring(0, 26) + [char]0x2026 }
   $script:pomoStatus.Text = ('{0}   {1}' -f $status, $dots)
-  $script:pomoStatus.ForeColor = switch ($track) { 'work' { $green } 'distract' { $orange } 'break' { $blue } default { $grey } }
+  # The expanded track palette (green/orange/blue) would vanish on the orange strip -
+  # orange-on-orange especially - so collapsed uses dark, distinct variants instead.
+  $script:pomoStatus.ForeColor = if ($onOrange) {
+    switch ($track) {
+      'work'     { [System.Drawing.Color]::FromArgb(20, 78, 42) }
+      'distract' { [System.Drawing.Color]::FromArgb(120, 22, 22) }
+      'break'    { [System.Drawing.Color]::FromArgb(22, 50, 110) }
+      default    { $dimOnOrange }
+    }
+  } else {
+    switch ($track) { 'work' { $green } 'distract' { $orange } 'break' { $blue } default { $grey } }
+  }
 
   Layout-Pomo
 
@@ -576,7 +595,13 @@ $pomoPulse.Interval = 550
 $pomoPulse.Add_Tick({
   if ($script:pomo -and [bool]$script:pomo.running -and ([string]$script:pomo.track -eq 'distract')) {
     $script:pomoPulseOn = -not $script:pomoPulseOn
-    $script:pomoStatus.ForeColor = if ($script:pomoPulseOn) { $orange } else { $white }
+    # On the orange strip an orange blink would be invisible - blink dark-red <-> white
+    # so the nag still reads; on the dark header keep the usual orange <-> white.
+    if ($script:collapsed) {
+      $script:pomoStatus.ForeColor = if ($script:pomoPulseOn) { [System.Drawing.Color]::FromArgb(120, 22, 22) } else { $white }
+    } else {
+      $script:pomoStatus.ForeColor = if ($script:pomoPulseOn) { $orange } else { $white }
+    }
   }
 })
 $pomoPulse.Start()
@@ -796,22 +821,26 @@ function Set-Collapsed([bool]$c) {
   Set-IconLabel $script:collapseBtn $icoCode $icoFb ([single]($script:posPt * 1.15))
   $posTip.SetToolTip($script:collapseBtn, $icoTip)
 
-  # Header chrome: orange strip + dark text collapsed, dark header + light text
-  # expanded. Re-apply the resting colours so the hover handlers and the position
+  # Header chrome: collapsed = orange strip with a WHITE title and dark chrome/Pomodoro
+  # icons (legible on orange); expanded = dark header with the orange brand title and
+  # grey chrome. Re-apply the resting colours so the hover handlers and the position
   # highlight fall back to the right palette.
   if ($c) {
-    $header.BackColor = $script:collapsedBg
-    $script:hdrFg     = $hdrDark
-    $script:hdrTitle  = $hdrDarkTitle
+    $header.BackColor    = $script:collapsedBg
+    $script:hdrFg        = $hdrDark
+    $script:hdrTitle     = $white      # white title on the orange strip
+    $script:pomoIconRest = $hdrDark    # dark Pomodoro controls on the orange strip
   } else {
-    $header.BackColor = $script:headerBg
-    $script:hdrFg     = $grey
-    $script:hdrTitle  = $white
+    $header.BackColor    = $script:headerBg
+    $script:hdrFg        = $grey
+    $script:hdrTitle     = Get-CDAccent   # brand orange title on the dark header
+    $script:pomoIconRest = $grey
   }
   $title.ForeColor              = $script:hdrTitle
   $close.ForeColor              = $script:hdrFg
   $script:gear.ForeColor        = $script:hdrFg
   $script:collapseBtn.ForeColor = $script:hdrFg
+  foreach ($c2 in @($script:pomoToggle, $script:pomoSkip, $script:pomoReset)) { $c2.ForeColor = $script:pomoIconRest }
   Update-PosHighlight
 
   Apply-PomoVisibility
@@ -851,7 +880,7 @@ function Update-CollapsePulse {
 
 # Highlight the active position; the others stay dim.
 function Update-PosHighlight {
-  $act = $script:hdrTitle   # white when expanded, dark when collapsed (on orange)
+  $act = $script:hdrTitle   # orange brand title expanded, white when collapsed (on orange)
   $idl = $script:hdrFg
   $script:posTop.ForeColor = if ($script:position -eq 'top')    { $act } else { $idl }
   $script:posBot.ForeColor = if ($script:position -eq 'bottom') { $act } else { $idl }
@@ -1501,12 +1530,21 @@ $script:fxLines = @(
 
 $script:fxFont      = New-Object System.Drawing.Font('Consolas', 13)
 $script:fxArtFont   = New-Object System.Drawing.Font('Consolas', 14, [System.Drawing.FontStyle]::Bold)
-$script:fxHeadBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(205, 255, 205))
-$script:fxArtBrush  = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(160, 255, 180))
+# Matrix rain in the brand orange instead of the classic green. The leading head
+# and the wink text are the accent blended toward white; the trail is the accent
+# scaled down so it fades to a dim ember.
+$script:fxAccent = Get-CDAccent
+$fxBlend = { param($f) [System.Drawing.Color]::FromArgb(
+  [int]($script:fxAccent.R + (255 - $script:fxAccent.R) * $f),
+  [int]($script:fxAccent.G + (255 - $script:fxAccent.G) * $f),
+  [int]($script:fxAccent.B + (255 - $script:fxAccent.B) * $f)) }
+$script:fxHeadBrush = New-Object System.Drawing.SolidBrush (& $fxBlend 0.78)
+$script:fxArtBrush  = New-Object System.Drawing.SolidBrush (& $fxBlend 0.45)
 $script:fxTrail     = New-Object 'System.Drawing.SolidBrush[]' $script:fxTrailLen
 for ($t = 0; $t -lt $script:fxTrailLen; $t++) {
-  $gv = [int][math]::Max(60, 255 - $t * 20)
-  $script:fxTrail[$t] = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(25, $gv, 60))
+  $k = [math]::Max(60, 255 - $t * 20) / 255.0
+  $script:fxTrail[$t] = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(
+    [int]($script:fxAccent.R * $k), [int]($script:fxAccent.G * $k), [int]($script:fxAccent.B * $k)))
 }
 
 # Full-deck overlay panel the rain is painted onto (hidden until a nudge).

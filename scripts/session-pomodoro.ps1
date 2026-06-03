@@ -102,7 +102,7 @@ $DISTRACT_KEYS = @(
   # shopping
   'amazon','ebay','aliexpress','etsy','temu',
   # gaming
-  'steam','epic games')
+  'steam','epic games','chess')
 
 # Optional per-user extensions: one keyword per line, lowercase substring match on
 # the browser tab title; blank lines and #comments are ignored. Merged once at tray

@@ -49,7 +49,7 @@ function Read-Events {
     try { $o = $ln | ConvertFrom-Json } catch { continue }
     if (-not $o.ts) { continue }
     try { $t = [datetime]$o.ts } catch { continue }
-    $events.Add([pscustomobject]@{ ts = $t; ev = [string]$o.ev; id = [string]$o.id; project = [string]$o.project; ctx = $o.ctx })
+    $events.Add([pscustomobject]@{ ts = $t; ev = [string]$o.ev; id = [string]$o.id; project = [string]$o.project; ctx = $o.ctx; sec = $o.sec })
   }
   return $events
 }
@@ -74,12 +74,22 @@ function Get-Stats($events) {
         $p   = $lastPrompt[$e.id]
         $dur = ($e.ts - $p.ts).TotalSeconds
         if ($dur -ge 0 -and $dur -le 7200) {
-          $turns.Add([pscustomobject]@{ project = $p.project; end = $e.ts; dur = $dur })
+          # tokens processed this turn = the context the model read at the stop
+          # event (input + cache). A proxy for token throughput, not a true cost.
+          $tok = 0; if ($null -ne $e.ctx) { try { $tok = [int]$e.ctx } catch { $tok = 0 } }
+          $turns.Add([pscustomobject]@{ project = $p.project; end = $e.ts; dur = $dur; tok = $tok })
         }
         $lastPrompt[$e.id] = $null
       }
     }
   }
+
+  # Distraction time (logged by the tray's classifier as 'distract' events, each
+  # carrying the seconds spent off task in that stint). Kept SEPARATE from focus
+  # time - it never inflates the focus totals; it surfaces as its own project row.
+  $distract = @($events | Where-Object { $_.ev -eq 'distract' })
+  $todayDistract = [int](($distract | Where-Object { $_.ts.Date -eq $today }     | ForEach-Object { try { [int]$_.sec } catch { 0 } } | Measure-Object -Sum).Sum)
+  $weekDistract  = [int](($distract | Where-Object { $_.ts.Date -ge $weekStart } | ForEach-Object { try { [int]$_.sec } catch { 0 } } | Measure-Object -Sum).Sum)
 
   $prompts = @($events | Where-Object { $_.ev -eq 'prompt' })
 
@@ -104,6 +114,8 @@ function Get-Stats($events) {
   $weekPrompts   = @($prompts | Where-Object { $_.ts.Date -ge $weekStart })
   $todayWork     = [int](($turns | Where-Object { $_.end.Date -eq $today }     | Measure-Object dur -Sum).Sum)
   $weekWork      = [int](($turns | Where-Object { $_.end.Date -ge $weekStart } | Measure-Object dur -Sum).Sum)
+  $todayTokens   = [long](($turns | Where-Object { $_.end.Date -eq $today }     | Measure-Object tok -Sum).Sum)
+  $weekTokens    = [long](($turns | Where-Object { $_.end.Date -ge $weekStart } | Measure-Object tok -Sum).Sum)
   $todayProjects = @($todayPrompts | Select-Object -ExpandProperty project -Unique).Count
   $weekProjects  = @($weekPrompts  | Select-Object -ExpandProperty project -Unique).Count
 
@@ -111,15 +123,21 @@ function Get-Stats($events) {
   $proj = @{}
   foreach ($p in $weekPrompts) {
     $k = $p.project; if (-not $k) { $k = 'session' }
-    if (-not $proj.ContainsKey($k)) { $proj[$k] = [pscustomobject]@{ project = $k; prompts = 0; work = 0 } }
+    if (-not $proj.ContainsKey($k)) { $proj[$k] = [pscustomobject]@{ project = $k; prompts = 0; work = 0; tokens = [long]0 } }
     $proj[$k].prompts++
   }
   foreach ($t in @($turns | Where-Object { $_.end.Date -ge $weekStart })) {
     $k = $t.project; if (-not $k) { $k = 'session' }
-    if (-not $proj.ContainsKey($k)) { $proj[$k] = [pscustomobject]@{ project = $k; prompts = 0; work = 0 } }
+    if (-not $proj.ContainsKey($k)) { $proj[$k] = [pscustomobject]@{ project = $k; prompts = 0; work = 0; tokens = [long]0 } }
     $proj[$k].work += $t.dur
+    $proj[$k].tokens += $t.tok
   }
   $top = @($proj.Values | Sort-Object @{ Expression = 'work'; Descending = $true }, @{ Expression = 'prompts'; Descending = $true } | Select-Object -First 6)
+  # Pin the distraction tally as its own row (always shown when there's any off-task
+  # time this week), so it reads as a project even if it wouldn't make the top 6.
+  if ($weekDistract -gt 0) {
+    $top = @($top) + @([pscustomobject]@{ project = 'distraction'; prompts = 0; work = $weekDistract; tokens = [long]0 })
+  }
 
   return [pscustomobject]@{
     todayPrompts = $todayPrompts.Count
@@ -128,6 +146,10 @@ function Get-Stats($events) {
     weekWork     = $weekWork
     todayProjects = $todayProjects
     weekProjects  = $weekProjects
+    todayTokens  = $todayTokens
+    weekTokens   = $weekTokens
+    todayDistract = $todayDistract
+    weekDistract  = $weekDistract
     streak       = $streak
     days         = [object[]]$days     # [object[]] cast, not @(...): casting a Hashtable to
     top          = [object[]]$top      # [pscustomobject] throws on @() arrays-of-PSObject (PS 5.1)
@@ -138,9 +160,22 @@ function Get-Stats($events) {
 function Format-Dur($sec) {
   $sec = [int]$sec
   if ($sec -le 0) { return '0m' }
-  $h = [int]($sec / 3600); $m = [int](($sec % 3600) / 60)
+  # NB: [int]($sec/3600) would ROUND (PS banker's rounding: 1920s -> "1h 32m"),
+  # so floor explicitly to truncate hours/minutes.
+  $h = [int][math]::Floor($sec / 3600); $m = [int][math]::Floor(($sec % 3600) / 60)
   if ($h -gt 0) { return ('{0}h {1:00}m' -f $h, $m) }
   return ('{0}m' -f $m)
+}
+
+# Compact token count: 1234 -> "1.2k", 3400000 -> "3.4M". Best-effort, never
+# throws. Uses invariant culture so the decimal is always a '.' (English UI).
+function Format-Tokens($n) {
+  try { $n = [double]$n } catch { return '0' }
+  $ci = [System.Globalization.CultureInfo]::InvariantCulture
+  if ($n -le 0)        { return '0' }
+  if ($n -lt 1000)     { return ([int]$n).ToString($ci) }
+  if ($n -lt 1000000)  { return ($n / 1000).ToString('0.#', $ci) + 'k' }
+  return ($n / 1000000).ToString('0.#', $ci) + 'M'
 }
 
 # --- Headless mode (for testing the computation without a window) -----------
@@ -148,13 +183,14 @@ if ($Print) {
   Remove-OldEvents
   $st = Get-Stats (Read-Events)
   Write-Output ('Events logged : {0}' -f $st.totalEvents)
-  Write-Output ('Today         : {0} prompts, {1} projects, {2} focus' -f $st.todayPrompts, $st.todayProjects, (Format-Dur $st.todayWork))
-  Write-Output ('This week     : {0} prompts, {1} projects, {2} focus' -f $st.weekPrompts, $st.weekProjects, (Format-Dur $st.weekWork))
+  Write-Output ('Today         : {0} prompts, {1} projects, {2} focus, {3} tokens' -f $st.todayPrompts, $st.todayProjects, (Format-Dur $st.todayWork), (Format-Tokens $st.todayTokens))
+  Write-Output ('This week     : {0} prompts, {1} projects, {2} focus, {3} tokens' -f $st.weekPrompts, $st.weekProjects, (Format-Dur $st.weekWork), (Format-Tokens $st.weekTokens))
+  Write-Output ('Distraction   : {0} today, {1} this week (off task)' -f (Format-Dur $st.todayDistract), (Format-Dur $st.weekDistract))
   Write-Output ('Streak        : {0} day(s)' -f $st.streak)
   Write-Output  'Activity (14d): '
   foreach ($d in $st.days) { Write-Output ('   {0}  {1}' -f $d.date.ToString('MM-dd'), ('#' * [math]::Min(40, $d.count))) }
   Write-Output  'Top projects  : '
-  foreach ($p in $st.top) { Write-Output ('   {0,-24} {1,3} prompts  {2}' -f $p.project, $p.prompts, (Format-Dur $p.work)) }
+  foreach ($p in $st.top) { Write-Output ('   {0,-24} {1,3} prompts  {2,-8}  {3,6} tok' -f $p.project, $p.prompts, (Format-Dur $p.work), (Format-Tokens $p.tokens)) }
   exit 0
 }
 
@@ -162,6 +198,11 @@ if ($Print) {
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 try { [System.Windows.Forms.Application]::SetProcessDPIAware() | Out-Null } catch {}
+
+# Reuse the deck's exact project badge (New-Badge) so the workspace logo is
+# pixel-identical here and in the large view. Must load AFTER System.Drawing and
+# after session-common.ps1 (New-Badge depends on both).
+. (Join-Path $PSScriptRoot 'session-ui-icons.ps1')
 
 $WindowTitle = 'ClaudeDeck Statistics'
 
@@ -212,26 +253,36 @@ $accent = [System.Drawing.Color]::FromArgb(110, 165, 240)
 # Get-TextOn now live in session-common.ps1 (shared with the deck).
 
 # --- Sizing relative to the primary screen (looks right at any resolution) ---
+# The Size preference (size.txt, written by the deck) scales this window in
+# lockstep with the large view: same source file, same scale factor (widthPct/55,
+# 55 = 1.0 reference), same window width (widthPct % of the screen). Read once at
+# startup — the stats window is short-lived and reopened, not live-refreshed.
 $screen  = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-$basePt  = [single][math]::Max(10, $screen.Height / 95.0)   # ~11pt on 1080p
-$titlePt = [single]($basePt * 1.7)
-$bigPt   = [single]($basePt * 2.6)
+$sizeFile = Get-CDPath 'size.txt'
+$widthPct = 48                                              # default = Normal (matches the deck)
+try { if (Test-Path $sizeFile) { $w = [int]((Get-Content $sizeFile -Raw -ErrorAction Stop).Trim()); if ($w -ge 30 -and $w -le 95) { $widthPct = $w } } } catch {}
+$scale   = $widthPct / 55.0                                 # 55 = 1.0 reference (same as the deck)
+$basePt  = [single][math]::Max(8, ($screen.Height / 95.0) * $scale)   # ~11pt at scale 1.0 on 1080p
+$titlePt = [single]($basePt * 1.55)
+$bigPt   = [single]($basePt * 2.0)
 $smallPt = [single]($basePt * 0.78)
 
 $fTitle = New-Object System.Drawing.Font('Segoe UI', $titlePt, [System.Drawing.FontStyle]::Bold)
 $fBig   = New-Object System.Drawing.Font('Segoe UI', $bigPt,   [System.Drawing.FontStyle]::Bold)
 $fLabel = New-Object System.Drawing.Font('Segoe UI', $smallPt, [System.Drawing.FontStyle]::Bold)
 $fBody  = New-Object System.Drawing.Font('Segoe UI', $basePt)
-$fBodyB = New-Object System.Drawing.Font('Segoe UI', $basePt,  [System.Drawing.FontStyle]::Bold)
 $fSmall = New-Object System.Drawing.Font('Segoe UI', $smallPt)
 
-$pad     = [int]($basePt * 2.0)
-$headerH = [int]($titlePt * 2.6)
-$cardH   = [int]($basePt * 7.5)
-$chartH  = [int]($basePt * 10.0)
-$rowH    = [int]($basePt * 3.2)
+$pad     = [int]($basePt * 1.7)
+$headerH = [int]($titlePt * 2.4)
+$cardH   = [int]($basePt * 5.8)
+$chartH  = [int]($basePt * 6.8)
+$rowH    = [int]($basePt * 2.9)
 
-$formW = [int]([math]::Min($screen.Width * 0.92, [math]::Max(680, $screen.Width * 0.42)))
+# Window width tracks the deck's Size preference (widthPct % of the screen), so
+# the two windows are the same width on screen. Floored so the 3-card layout never
+# cramps, and capped so it never overflows the monitor.
+$formW = [int]([math]::Min($screen.Width * 0.95, [math]::Max(520, $screen.Width * $widthPct / 100.0)))
 # Content height drives the window height so there's never a big empty area.
 $contentH = $headerH + $pad + $cardH + $pad + ($basePt * 2.0) + $chartH + $pad + ($basePt * 2.0) + (6 * ($rowH + $basePt)) + $pad
 $formH = [int]([math]::Min($screen.Height * 0.92, $contentH))
@@ -364,8 +415,8 @@ $canvas.Add_Paint({
   $c2 = New-Object System.Drawing.Rectangle(($pad + $cardW + $gap), $y, $cardW, $cardH)
   $c3 = New-Object System.Drawing.Rectangle(($pad + ($cardW + $gap) * 2), $y, ($W - $pad - ($pad + ($cardW + $gap) * 2)), $cardH)
   $projWord = { param($n) if ($n -eq 1) { '1 project' } else { ('{0} projects' -f $n) } }
-  Draw-Card $g $c1 'Today'     ([string]$st.todayPrompts) $green  (& $projWord $st.todayProjects) ((Format-Dur $st.todayWork) + ' focus')
-  Draw-Card $g $c2 'This week' ([string]$st.weekPrompts)  $accent (& $projWord $st.weekProjects)  ((Format-Dur $st.weekWork) + ' focus')
+  Draw-Card $g $c1 'Today'     ([string]$st.todayPrompts) $green  (& $projWord $st.todayProjects) ((Format-Dur $st.todayWork) + ' focus ' + [char]0x2022 + ' ' + (Format-Tokens $st.todayTokens) + ' tok')
+  Draw-Card $g $c2 'This week' ([string]$st.weekPrompts)  $accent (& $projWord $st.weekProjects)  ((Format-Dur $st.weekWork) + ' focus ' + [char]0x2022 + ' ' + (Format-Tokens $st.weekTokens) + ' tok')
   $streakSub = if ($st.streak -eq 1) { 'day in a row' } else { 'days in a row' }
   Draw-Card $g $c3 'Streak'    ([string]$st.streak)       $orange $streakSub ('prompts: ' + $st.weekPrompts + ' this week')
   $y += $cardH + $pad
@@ -416,22 +467,38 @@ $canvas.Add_Paint({
     $maxWork = ($top | Measure-Object work -Maximum).Maximum
     if ($maxWork -lt 1) { $maxWork = 1 }
     $badge = [int]($rowH * 0.62)
-    $statW = [int]($basePt * 11)
+    $statW = [int]($basePt * 15)
+    $distractRed = [System.Drawing.Color]::FromArgb(235, 95, 95)
     foreach ($p in $top) {
       $rowY = $y
-      # badge
-      $col = Get-ProjectColor $p.project
-      $bRect = New-Object System.Drawing.Rectangle($pad, ($rowY + [int](($rowH - $badge)/2)), $badge, $badge)
-      Add-RoundRect $g $bRect ([int]($badge * 0.28)) $col
-      $bTxt = New-SolidBrush (Get-TextOn $col)
-      $g.DrawString((Get-Initials $p.project), $fBodyB, $bTxt, (New-Object System.Drawing.RectangleF($bRect.X, $bRect.Y, $badge, $badge)), $sfC)
-      $bTxt.Dispose()
+      $isDistract = ($p.project -eq 'distraction')
+      $bx = $pad; $by = $rowY + [int](($rowH - $badge)/2)
+      if ($isDistract) {
+        # Distinct red badge with a "!" so off-task time never reads like a project.
+        $col = $distractRed
+        Add-RoundRect $g (New-Object System.Drawing.Rectangle($bx, $by, $badge, $badge)) ([int]($badge * 0.28)) $col
+        $bExc = New-SolidBrush $white
+        $g.DrawString('!', $fLabel, $bExc, (New-Object System.Drawing.RectangleF($bx, $by, $badge, $badge)), $sfC)
+        $bExc.Dispose()
+      } else {
+        # badge — same renderer as the deck (New-Badge) so the workspace logo is identical
+        $col = Get-ProjectColor $p.project
+        $bmp = New-Badge $p.project $badge
+        $g.DrawImage($bmp, $bx, $by, $badge, $badge)
+        $bmp.Dispose()
+      }
       # name
       $nameX = $pad + $badge + [int]($basePt * 0.9)
-      $g.DrawString($p.project, $fBody, $bWhite, (New-Object System.Drawing.RectangleF($nameX, ($rowY + ($rowH - $basePt*1.6)/2), ($W - $nameX - $statW - $pad), $basePt*1.8)), $sf)
-      # right-aligned stat: "12 prompts  ·  1h 20m"
-      $statTxt = ('{0} ' -f $p.prompts) + [char]0x2022 + ' ' + (Format-Dur $p.work)
-      $g.DrawString($statTxt, $fSmall, $bGrey, (New-Object System.Drawing.RectangleF(($W - $statW - $pad), ($rowY + ($rowH - $basePt*1.6)/2), $statW, $basePt*1.8)), $sfR)
+      $nameTxt   = if ($isDistract) { 'Distraction' } else { $p.project }
+      $nameBrush = if ($isDistract) { New-SolidBrush $distractRed } else { $bWhite }
+      $g.DrawString($nameTxt, $fBody, $nameBrush, (New-Object System.Drawing.RectangleF($nameX, ($rowY + ($rowH - $basePt*1.6)/2), ($W - $nameX - $statW - $pad), $basePt*1.8)), $sf)
+      if ($isDistract) { $nameBrush.Dispose() }
+      # right-aligned stat: "12  ·  1h 20m  ·  1.2M tok"  (distraction: just the time off task)
+      $statTxt = if ($isDistract) { (Format-Dur $p.work) + ' off task' }
+                 else { ('{0} ' -f $p.prompts) + [char]0x2022 + ' ' + (Format-Dur $p.work) + ' ' + [char]0x2022 + ' ' + (Format-Tokens $p.tokens) + ' tok' }
+      $statBrush = if ($isDistract) { New-SolidBrush $distractRed } else { $bGrey }
+      $g.DrawString($statTxt, $fSmall, $statBrush, (New-Object System.Drawing.RectangleF(($W - $statW - $pad), ($rowY + ($rowH - $basePt*1.6)/2), $statW, $basePt*1.8)), $sfR)
+      if ($isDistract) { $statBrush.Dispose() }
       # work bar under the name
       $barX = $nameX; $barFullW = $W - $nameX - $statW - $pad * 2
       $barY = $rowY + $rowH - [int]($basePt * 0.9)

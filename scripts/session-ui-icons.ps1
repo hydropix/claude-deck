@@ -12,10 +12,11 @@
 #   settings e8b8  close e5cd  vertical_align_top/bottom e25a/e258
 #   fiber_manual_record e061 (filled)  radio_button_unchecked e836 (outline)
 #   play e037  pause e034  skip e044  replay e042  expand_less/more e5ce/e5cf
+#   edit e3c9 (pencil — the per-project objective button)
 $script:MAT = @{ top=0xE25A; bottom=0xE258; settings=0xE8B8; close=0xE5CD;
                  dotFull=0xE061; dotEmpty=0xE836;
                  play=0xE037; pause=0xE034; skip=0xE044; replay=0xE042;
-                 collapse=0xE5CE; expand=0xE5CF }   # expand_less / expand_more (chevrons)
+                 collapse=0xE5CE; expand=0xE5CF; edit=0xE3C9 }   # expand_less / expand_more (chevrons) + edit (pencil)
 $script:matPfc    = $null
 $script:matFamily = $null
 $matPath = Join-Path $PSScriptRoot 'MaterialIcons-Regular.ttf'

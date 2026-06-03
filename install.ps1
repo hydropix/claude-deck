@@ -10,6 +10,18 @@ $settings = Join-Path $env:USERPROFILE '.claude\settings.json'
 
 Write-Host 'ClaudeDeck - installation...' -ForegroundColor Cyan
 
+# --- 0) Stop running ClaudeDeck processes ----------------------------------
+# The deck loads logo.ico + MaterialIcons-Regular.ttf and holds them open, so a
+# copy/update while it (or the tray/recap/stats) is running would fail to
+# overwrite those files - and PS aborts the whole copy on the first locked file,
+# half-applying the update. Stop them all first; the tray is restarted in step 4.
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+  Where-Object {
+    $_.CommandLine -like '*session-tray.ps1*'  -or $_.CommandLine -like '*session-view.ps1*' -or
+    $_.CommandLine -like '*session-recap.ps1*' -or $_.CommandLine -like '*session-stats.ps1*'
+  } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Milliseconds 700   # let the font/icon handles release before we copy
+
 # --- 1) Copy scripts -------------------------------------------------------
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 Get-ChildItem $src -File | ForEach-Object { Copy-Item $_.FullName (Join-Path $dest $_.Name) -Force }
@@ -96,6 +108,47 @@ if (-not $cfg.Contains('preferredNotifChannel') -or -not $cfg['preferredNotifCha
 $json = $cfg | ConvertTo-Json -Depth 30
 [System.IO.File]::WriteAllText($settings, $json, (New-Object System.Text.UTF8Encoding($false)))
 Write-Host "  Hooks merged into $settings (backup: settings.json.bak)"
+
+# --- 2b) Seed / top up .env (user-editable LLM / recap settings) -----------
+# Create .env from .env.example ONCE; never overwrite an existing .env so the
+# user's edits (e.g. their server URL / API key) survive updates. When .env
+# already exists, TOP IT UP with any keys the template gained since (e.g. a new
+# provider option) - appended with their example values, existing values are
+# never touched - so new settings stay discoverable after an update.
+$envFile     = Join-Path $dest '.env'
+$envTemplate = Join-Path $dest '.env.example'
+function Get-EnvKeys($path) {
+  $keys = @{}
+  if (Test-Path $path) {
+    foreach ($l in [System.IO.File]::ReadAllLines($path)) {
+      $t = $l.Trim()
+      if ($t -and -not $t.StartsWith('#')) { $k = ($t -split '=', 2)[0].Trim(); if ($k) { $keys[$k] = $true } }
+    }
+  }
+  return $keys
+}
+if (Test-Path $envTemplate) {
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  if (-not (Test-Path $envFile)) {
+    Copy-Item $envTemplate $envFile -Force
+    Write-Host "  .env created from .env.example (edit it to set your LLM provider / server)"
+  } else {
+    $have = Get-EnvKeys $envFile
+    $missing = @()
+    foreach ($l in [System.IO.File]::ReadAllLines($envTemplate)) {
+      $t = $l.Trim()
+      if ($t -and -not $t.StartsWith('#')) {
+        $k = ($t -split '=', 2)[0].Trim()
+        if ($k -and -not $have.ContainsKey($k)) { $missing += $l }
+      }
+    }
+    if ($missing.Count -gt 0) {
+      $block = "`r`n# --- new settings added by the ClaudeDeck updater (see .env.example for docs) ---`r`n" + ($missing -join "`r`n") + "`r`n"
+      [System.IO.File]::AppendAllText($envFile, $block, $utf8NoBom)
+      Write-Host ("  .env topped up with {0} new setting(s)" -f $missing.Count)
+    }
+  }
+}
 
 # --- 3) Shortcuts ----------------------------------------------------------
 $ws = New-Object -ComObject WScript.Shell

@@ -44,13 +44,23 @@ Scripts under `scripts/` are split into **entry points** (run directly / by a la
   events into "turns" to derive focus time, and draws today/week cards, a 14-day activity chart,
   and top projects. Supports `-Print` for a headless text summary (use this to test the math).
   Dot-sources `session-common.ps1`.
+- **session-recap.ps1** — the weekly recap popup, auto-opened by the tray every Friday at 17:00
+  (and from the tray's "Weekly recap" menu). Gathers the work week's user requests (Mon 00:00 →
+  now) per project by reading the Claude Code transcripts under `~/.claude/projects/<dir>/*.jsonl`,
+  pairs each project with its manual objective from `objectives.json`, and asks an LLM for a short
+  per-project synthesis. The provider is pluggable via `.env` (`Get-CDEnv`): `LLM_PROVIDER=ollama`
+  (native `/api/generate`) or `openai` (any OpenAI-compatible `/v1/chat/completions` endpoint). LLM calls run
+  in a background runspace, polled by a UI timer so cards fill in as they arrive; if Ollama is off
+  or unreachable it falls back to listing the raw requests. `-Print` dumps the gathered data
+  headlessly (test the parsing without UI/LLM); `-Days N` overrides the window. Dot-sources
+  `session-common.ps1`.
 - **session-update.ps1** — optional self-updater. `-Check` compares the installed `version.txt`
   with the repo's and writes `update.json`; `-Apply` downloads and runs the latest setup `.cmd`.
   Standalone (a leaf, run as a child process).
 - **session-workspaces.ps1** — favorite-workspace save/restore. Dual-mode: run directly with
   `-Save`/`-Restore`/`-List`, or dot-sourced. Run as a hidden child process by the deck, NOT
   dot-sourced into it (its `param()` block + action logic would leak — see its header).
-- **\*.vbs** (`start-tray`, `show-view`, `show-stats`) — thin launchers that run the matching
+- **\*.vbs** (`start-tray`, `show-view`, `show-stats`, `show-recap`) — thin launchers that run the matching
   `.ps1` via `powershell -WindowStyle Hidden` so there's no console flash. Shortcuts and the
   tray menu always go through these, never the `.ps1` directly.
 
@@ -60,9 +70,9 @@ load into a live WinForms scope — see `session-common.ps1`'s header for the ru
 - **session-common.ps1** — the shared library every UI script loads: the data-layout paths
   (`Get-CDRoot` / `Get-CDPath`), UTF-8-no-BOM writes (`Get-CDUtf8` / `Write-CDText`), the flag
   toggle (`Toggle-Flag`), the per-project colour/badge helpers (`Get-ProjectColor` /
-  `Get-Initials` / `Get-TextOn` / `Hue2Rgb`), and the self-updater bridge (`Get-LocalVersion` /
-  `Invoke-Updater` / `Get-UpdateInfo`). Single source of truth for things that used to be
-  copy-pasted across the deck, tray and stats.
+  `Get-Initials` / `Get-TextOn` / `Hue2Rgb`), the `.env` reader (`Get-CDEnv`, with built-in
+  defaults), and the self-updater bridge (`Get-LocalVersion` / `Invoke-Updater` / `Get-UpdateInfo`).
+  Single source of truth for things that used to be copy-pasted across the deck, tray and stats.
 - **session-pomodoro.ps1** — the whole Pomodoro engine + the foreground-activity classifier,
   loaded by the tray. Runs its own 1s timer, publishes `pomodoro.json`, consumes
   `pomodoro-cmd.txt`, and exposes `Get-PomoCategory` / `Play-PomoChime` (also used by the tray's
@@ -90,8 +100,16 @@ these files:
   (`running`/`waiting`/`done`), `updated`, `ctx_tokens`. Overwritten each event; pruned after 24h.
 - `stats/events.jsonl` — append-only history (`{ ts, ev, id, project, ctx }` per line). This is
   what makes trends/durations possible; trimmed to 90 days by the stats view.
+- `objectives.json` — `{ items: { "<project>": "<text>" } }`: the manually-typed per-project
+  objective the deck's group header edits and the weekly recap reads as each card's title.
 - Flag files (presence = on): `dnd.flag`, `closeoutside.flag`, `autoupdate.flag`.
-- Value files: `opacity.txt` (20–100), `size.txt` (scale), `update.json`, `version.txt`.
+- Value files: `opacity.txt` (20–100), `size.txt` (scale), `update.json`, `version.txt`,
+  `recap-shown.txt` (Monday-date tag of the last shown weekly recap, so it fires once/week).
+- `.env` — user-editable settings (seeded once from `.env.example`, never overwritten): the
+  weekly-recap LLM config — `LLM_PROVIDER` (`ollama`|`openai`), `LLM_URL`/`LLM_MODEL`/`LLM_API_KEY`
+  for the OpenAI-compatible path, the legacy `OLLAMA_URL`/`OLLAMA_MODEL` for the native path
+  (honoured as fallbacks), plus `LLM_ENABLED`/`LLM_TIMEOUT` and `RECAP_INCLUDE_OUTCOMES`/
+  `RECAP_OUTCOME_CHARS`. Read via `Get-CDEnv`. Saved recaps land in `recaps/recap-<Monday>.md`.
 
 ### Hooks wired by the installer
 

@@ -39,39 +39,31 @@ if (-not $mutexCreated) {
 $stateDir    = Join-Path $env:USERPROFILE '.claude\sessions\state'
 $closeFlag   = Join-Path $env:USERPROFILE '.claude\sessions\closeoutside.flag'   # opt-in: close on outside click
 $dndFlag     = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'            # suspend auto-popup on completion
-$focusFlag   = Join-Path $env:USERPROFILE '.claude\sessions\focus.flag'          # opt-in: nudge me back when Claude is idle and I'm distracted
+$focusOffFlag = Join-Path $env:USERPROFILE '.claude\sessions\focus-off.flag'     # opt-OUT: the nudge is ON by default, this marker disables it
 $posFile     = Join-Path $env:USERPROFILE '.claude\sessions\position.txt'        # top | bottom | free
 $posXFile    = Join-Path $env:USERPROFILE '.claude\sessions\posx.txt'            # custom left (px); present = user dragged a horizontal spot
 $posYFile    = Join-Path $env:USERPROFILE '.claude\sessions\posy.txt'            # custom top (px); used only when position = free
 $opacityFile = Join-Path $env:USERPROFILE '.claude\sessions\opacity.txt'         # 20..100 (window opacity %)
-$sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'            # 30..95 (overall scale; 55 = Normal/1.0, drives width + fonts)
+$sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'            # 24..95 (overall scale; 42 = Normal, drives width + fonts)
 
 # Update toggle + stats launcher (the updater bridge itself - Get-LocalVersion /
 # Invoke-Updater / Get-UpdateInfo - lives in session-common.ps1 and resolves its
 # own paths).
 $autoUpdFlag = Join-Path $env:USERPROFILE '.claude\sessions\autoupdate.flag'
 $statsVbs    = Join-Path $env:USERPROFILE '.claude\sessions\show-stats.vbs'
+$recapVbs    = Join-Path $env:USERPROFILE '.claude\sessions\show-recap.vbs'
 
 # Pomodoro: the tray owns the clock + tracking and writes pomodoro.json; the deck
 # header just renders it and drops control tokens into pomodoro-cmd.txt.
 $pomoState   = Join-Path $env:USERPROFILE '.claude\sessions\pomodoro.json'
 $pomoCmd     = Join-Path $env:USERPROFILE '.claude\sessions\pomodoro-cmd.txt'
 
-# Focus nudge: the tray stamps a tick count into focus-nudge.txt on each nudge.
-# We poll it on the 1s Pomodoro timer and play the animation when the stamp is fresh.
-# At startup: a STALE stamp is seeded into lastNudgeSeen (so opening the deck later
-# never replays an old nudge), but a FRESH one is left unseen - that's the case where
-# the tray popped the deck open *for* this nudge, so the first poll should play it.
+# Focus nudge: the tray re-stamps a tick count into focus-nudge.txt every few seconds
+# the whole time you stay on a distraction. We poll it on the 1s Pomodoro timer and
+# hold the Matrix overlay up while the stamp is fresh, fading it once you refocus a
+# real app (the stamps stop). A stale stamp at startup is simply ignored by the age
+# check, so opening the deck later never replays an old nudge.
 $nudgeFile   = Join-Path $env:USERPROFILE '.claude\sessions\focus-nudge.txt'
-$script:lastNudgeSeen = $null
-try {
-  if (Test-Path $nudgeFile) {
-    $nv = ([System.IO.File]::ReadAllText($nudgeFile)).Trim()
-    $nAge = 999999
-    try { $nAge = [Environment]::TickCount - [int]$nv } catch {}
-    if (-not ($nAge -ge 0 -and $nAge -lt 12000)) { $script:lastNudgeSeen = $nv }
-  }
-} catch {}
 
 # Get-LocalVersion / Invoke-Updater / Get-UpdateInfo (the self-updater bridge) and
 # Toggle-Flag now live in session-common.ps1.
@@ -94,6 +86,111 @@ function Get-FavCount {
   return 0
 }
 
+# --- Per-project objectives ------------------------------------------------
+# A manually-typed objective / title / TODO for a project, shared by ALL of that
+# project's sessions. Stored as { items: { "<project>": "<text>" } } in objectives.json
+# (UTF-8 no BOM via Write-CDText). Re-read on every refresh so an edit shows live.
+$objFile = Join-Path $env:USERPROFILE '.claude\sessions\objectives.json'
+$script:objectives = @{}
+function Read-Objectives {
+  $script:objectives = @{}
+  try {
+    if (Test-Path $objFile) {
+      $o = [System.IO.File]::ReadAllText($objFile) | ConvertFrom-Json
+      if ($o -and $o.items) {
+        foreach ($p in $o.items.PSObject.Properties) { $script:objectives[$p.Name] = [string]$p.Value }
+      }
+    }
+  } catch {}
+}
+function Get-Objective([string]$project) {
+  if (-not $project) { return '' }
+  if ($script:objectives.ContainsKey($project)) { return [string]$script:objectives[$project] }
+  return ''
+}
+# Save (or clear, when blank) a project's objective, then persist the whole map.
+function Set-Objective([string]$project, [string]$text) {
+  if (-not $project) { return }
+  Read-Objectives                                      # merge onto the latest on-disk map
+  $text = ([string]$text).Trim()
+  if ($text) { $script:objectives[$project] = $text }
+  elseif ($script:objectives.ContainsKey($project)) { $script:objectives.Remove($project) }
+  $items = New-Object psobject
+  foreach ($k in $script:objectives.Keys) { $items | Add-Member -NotePropertyName $k -NotePropertyValue $script:objectives[$k] }
+  try { Write-CDText $objFile ([pscustomobject]@{ items = $items } | ConvertTo-Json -Depth 5) } catch {}
+}
+
+# Small modal dialog to type/edit a project's objective. Returns the new text on
+# Save (possibly empty -> clears it) or $null on Cancel. Suppresses the deck's
+# click-outside-close while it's open (same guard as the settings menu).
+function Prompt-Objective([string]$project) {
+  $cur = Get-Objective $project
+  $script:menuOpen = $true
+  $dlg = New-Object System.Windows.Forms.Form
+  $dlg.Text            = 'Objective'
+  $dlg.FormBorderStyle = 'FixedDialog'
+  $dlg.StartPosition   = 'CenterScreen'
+  $dlg.TopMost         = $true
+  $dlg.MaximizeBox     = $false
+  $dlg.MinimizeBox     = $false
+  $dlg.ShowInTaskbar   = $false
+  $dlg.BackColor       = $bg
+  $dlg.ForeColor       = $white
+  $dlg.ClientSize      = New-Object System.Drawing.Size(480, 132)
+  try { if (Test-Path $iconPath) { $dlg.Icon = New-Object System.Drawing.Icon($iconPath) } } catch {}
+
+  $lbl = New-Object System.Windows.Forms.Label
+  $lbl.Text      = ('Objective for ' + $project)
+  $lbl.ForeColor = $grey
+  $lbl.AutoSize  = $true
+  $lbl.Font      = New-Object System.Drawing.Font('Segoe UI', 10)
+  $lbl.Location  = New-Object System.Drawing.Point(16, 14)
+  $dlg.Controls.Add($lbl)
+
+  $txt = New-Object System.Windows.Forms.TextBox
+  $txt.Text        = $cur
+  $txt.BackColor   = $rowBg
+  $txt.ForeColor   = $white
+  $txt.BorderStyle = 'FixedSingle'
+  $txt.Font        = New-Object System.Drawing.Font('Segoe UI', 12)
+  $txt.Location    = New-Object System.Drawing.Point(16, 42)
+  $txt.Size        = New-Object System.Drawing.Size(448, 28)
+  $txt.MaxLength   = 200
+  $dlg.Controls.Add($txt)
+
+  $ok = New-Object System.Windows.Forms.Button
+  $ok.Text         = 'Save'
+  $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+  $ok.FlatStyle    = 'Flat'
+  $ok.ForeColor    = $white
+  $ok.BackColor    = $rowBg
+  $ok.Size         = New-Object System.Drawing.Size(96, 30)
+  $ok.Location     = New-Object System.Drawing.Point(264, 86)
+  $dlg.Controls.Add($ok)
+
+  $cl = New-Object System.Windows.Forms.Button
+  $cl.Text         = 'Cancel'
+  $cl.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+  $cl.FlatStyle    = 'Flat'
+  $cl.ForeColor    = $grey
+  $cl.BackColor    = $rowBg
+  $cl.Size         = New-Object System.Drawing.Size(96, 30)
+  $cl.Location     = New-Object System.Drawing.Point(368, 86)
+  $dlg.Controls.Add($cl)
+
+  $dlg.AcceptButton = $ok
+  $dlg.CancelButton = $cl
+  $dlg.Add_Shown({ $txt.Focus(); $txt.SelectAll() }.GetNewClosure())
+
+  $res = $dlg.ShowDialog()
+  $val = $txt.Text
+  $dlg.Dispose()
+  $script:menuOpen = $false
+  $script:shownAt  = [Environment]::TickCount   # re-arm the click-outside grace
+  if ($res -eq [System.Windows.Forms.DialogResult]::OK) { return $val }
+  return $null
+}
+
 # Material icon glyphs ($script:MAT codepoints, the private font collection, and
 # New-IconFont / Get-IconChar / Set-IconLabel / New-MatIcon / New-Badge) live in
 # session-ui-icons.ps1, dot-sourced above.
@@ -104,7 +201,7 @@ $script:position   = 'top'
 $script:customLeft = $null       # custom horizontal left (px); $null = centered
 $script:customTop  = $null       # custom top (px); used only when position = free
 $script:opacity  = 0.92          # default: light transparency (Light)
-$script:widthPct = 48            # default size = Normal (% of screen width)
+$script:widthPct = 42            # default size = Normal (% of screen width)
 function Read-Prefs {
   $script:position = 'top'
   try { if (Test-Path $posFile) { $p = (Get-Content $posFile -Raw -ErrorAction Stop).Trim().ToLower(); if ($p -in @('top','bottom','free')) { $script:position = $p } } } catch {}
@@ -114,8 +211,8 @@ function Read-Prefs {
   try { if (Test-Path $posYFile) { $script:customTop = [int]((Get-Content $posYFile -Raw -ErrorAction Stop).Trim()) } } catch {}
   $script:opacity = 0.92         # default: light transparency (Light)
   try { if (Test-Path $opacityFile) { $v = [int]((Get-Content $opacityFile -Raw -ErrorAction Stop).Trim()); if ($v -ge 20 -and $v -le 100) { $script:opacity = $v / 100.0 } } } catch {}
-  $script:widthPct = 48          # default size = Normal
-  try { if (Test-Path $sizeFile) { $w = [int]((Get-Content $sizeFile -Raw -ErrorAction Stop).Trim()); if ($w -ge 30 -and $w -le 95) { $script:widthPct = $w } } } catch {}
+  $script:widthPct = 42          # default size = Normal
+  try { if (Test-Path $sizeFile) { $w = [int]((Get-Content $sizeFile -Raw -ErrorAction Stop).Trim()); if ($w -ge 24 -and $w -le 95) { $script:widthPct = $w } } } catch {}
 }
 
 # A dragged spot (including another monitor) is remembered only while this view
@@ -139,8 +236,8 @@ Reset-LaunchPosition   # fresh launch always starts on the primary screen
 # The Size preference scales the WHOLE view homothetically: not just the window
 # width, but fonts, badges, paddings, row + header heights — everything grows or
 # shrinks together. The scale factor is $widthPct / 55 (55 is the 1.0 reference);
-# the presets sit below it for a compact feel: Compact 36% -> 0.65x, Normal 48% ->
-# 0.87x, Large 60% -> 1.09x.
+# the presets sit below it for a compact feel: Mini 24% -> 0.44x, Compact 30% ->
+# 0.55x, Normal 42% -> 0.76x, Large 54% -> 0.98x.
 $screen = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $formH  = [int]($screen.Height * 0.70)
 
@@ -161,6 +258,8 @@ function Compute-Dims {
   $script:listPadX  = [int][math]::Max(8, 16 * $script:scale)
   $script:listPadY  = [int][math]::Max(6, 12 * $script:scale)
   $script:listPadV  = $script:listPadY * 2
+  $script:grpH      = [int][math]::Max(22, $script:rowPt * 2.4)                  # per-project objective header
+  $script:rowIndent = [int][math]::Max(14, 20 * $script:scale)                  # rows nest under their header
 }
 Compute-Dims
 $script:appliedWidthPct = $script:widthPct   # tracks the size currently rendered
@@ -516,9 +615,9 @@ function Build-SettingsMenu {
   [void]$m.Items.Add($co)
 
   $fn = New-Object System.Windows.Forms.ToolStripMenuItem('Focus nudge')
-  $fn.Checked = (Test-Path $focusFlag)
-  $fn.ToolTipText = "When no session is running and you drift to a distracting app, Claude nudges you back with a sound + popup (off by default)"
-  $fn.Add_Click({ Toggle-Flag $focusFlag })
+  $fn.Checked = (-not (Test-Path $focusOffFlag))
+  $fn.ToolTipText = "When no session is running and you drift to a distracting app, Claude nudges you back with a sound + popup and keeps it up until you refocus a real app (on by default)"
+  $fn.Add_Click({ Toggle-Flag $focusOffFlag })
   [void]$m.Items.Add($fn)
 
   # Transparency submenu — writes opacity % (re-read live on the next refresh).
@@ -543,9 +642,10 @@ function Build-SettingsMenu {
   $szMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Size')
   $szMenu.ToolTipText = "Overall size of this view (scales everything together)"
   foreach ($sz in @(
-      @{ v = 36; l = 'Compact' },
-      @{ v = 48; l = 'Normal' },
-      @{ v = 60; l = 'Large' })) {
+      @{ v = 24; l = 'Mini' },
+      @{ v = 30; l = 'Compact' },
+      @{ v = 42; l = 'Normal' },
+      @{ v = 54; l = 'Large' })) {
     $mi = New-Object System.Windows.Forms.ToolStripMenuItem($sz.l)
     $mi.Checked = ($curSize -eq $sz.v)
     $val = $sz.v
@@ -605,6 +705,21 @@ function Build-SettingsMenu {
   $stats.Add_Click({ Start-Process wscript.exe -ArgumentList ('"{0}"' -f $statsVbs) -ErrorAction SilentlyContinue })
   [void]$m.Items.Add($stats)
 
+  $recap = New-Object System.Windows.Forms.ToolStripMenuItem('Generate weekly recap now')
+  $recap.ToolTipText = "Summarize this week's work per project right now (also auto-opens every Friday at 17:00)"
+  $recap.Add_Click({ Start-Process wscript.exe -ArgumentList ('"{0}"' -f $recapVbs) -ErrorAction SilentlyContinue })
+  [void]$m.Items.Add($recap)
+
+  $envEdit = New-Object System.Windows.Forms.ToolStripMenuItem('Edit recap settings (.env)')
+  $envEdit.ToolTipText = "Open the .env file (LLM provider, server URL, model, API key) in Notepad"
+  $envEdit.Add_Click({
+    $envPath = Join-Path $env:USERPROFILE '.claude\sessions\.env'
+    $tmpl    = Join-Path $env:USERPROFILE '.claude\sessions\.env.example'
+    if (-not (Test-Path $envPath) -and (Test-Path $tmpl)) { Copy-Item $tmpl $envPath -Force -ErrorAction SilentlyContinue }
+    Start-Process notepad.exe ('"{0}"' -f $envPath) -ErrorAction SilentlyContinue
+  })
+  [void]$m.Items.Add($envEdit)
+
   $hide = New-Object System.Windows.Forms.ToolStripMenuItem('Hide this view')
   $hide.ToolTipText = "Close the view (the tray keeps running; reopen with Win+Alt+C)"
   $hide.Add_Click({ $form.Close() })
@@ -635,6 +750,12 @@ $script:gear.Add_Click({
 # everything (full width, dark header, list, fit-to-rows height).
 $script:collapsed = $false
 $script:collapsedActivePomo = $false
+# Collapsed-strip "heartbeat": while collapsed AND at least one session is active
+# (running or waiting), the orange header pulses smoothly toward black so the tucked-
+# away strip still signals "work is happening". Driven by $collapsePulse (defined with
+# the other timers); $script:activeCount is refreshed by Refresh-List.
+$script:headerPulseOn = $false
+$script:activeCount   = 0
 
 # True while a Pomodoro timer is actually running — the only state worth keeping
 # on-screen when collapsed.
@@ -711,8 +832,22 @@ function Set-Collapsed([bool]$c) {
     $script:lastSig = $null   # force a rebuild + auto-fit on the next refresh
     Refresh-List
   }
+  Update-CollapsePulse
 }
 $script:collapseBtn.Add_Click({ Set-Collapsed (-not $script:collapsed) })
+
+# Start/stop the collapsed-strip heartbeat to match the current state: pulse only
+# while collapsed with an active session. When it shouldn't run, restore the flat
+# orange resting colour (so a stopped pulse never freezes mid-fade).
+function Update-CollapsePulse {
+  $want = ($script:collapsed -and ($script:activeCount -gt 0))
+  if ($want) {
+    if (-not $script:headerPulseOn) { $script:headerPulseOn = $true; $collapsePulse.Start() }
+  } else {
+    if ($script:headerPulseOn) { $script:headerPulseOn = $false; $collapsePulse.Stop() }
+    if ($script:collapsed) { $header.BackColor = $script:collapsedBg }
+  }
+}
 
 # Highlight the active position; the others stay dim.
 function Update-PosHighlight {
@@ -849,7 +984,92 @@ $script:rowTip = New-Object System.Windows.Forms.ToolTip
 # Get-RepoWebUrl / Get-RepoMenuLabel / Get-RepoSubLinks (the row's repo links) and
 # Open-Terminal live in session-ui-repo.ps1, dot-sourced above.
 
-function Make-Row($s, $status, $seen, $promptText, $age) {
+# Per-project objective header: a slim bar above each project's session rows. Carries
+# the manually-typed objective as its title (a dim placeholder when none is set yet),
+# a project-coloured accent on the left, and a pencil button at the FAR right that
+# opens the editor. Clicking the title text opens it too.
+function Make-GroupHeader($project) {
+  $obj = Get-Objective $project
+  $pad = New-Object System.Windows.Forms.Panel
+  $pad.Width     = $list.ClientSize.Width - ($script:listPadX * 2 + 8)
+  $pad.Height    = $script:grpH
+  $pad.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 36)
+  $pad.Margin    = New-Object System.Windows.Forms.Padding(0, $script:rowMargin, 0, 2)
+
+  # Project-coloured accent bar — ties the header to the matching badges below it.
+  $accent = New-Object System.Windows.Forms.Panel
+  $accent.BackColor = Get-ProjectColor $project
+  $accent.Location  = New-Object System.Drawing.Point(0, 0)
+  $accent.Size      = New-Object System.Drawing.Size(4, $pad.Height)
+  $accent.Anchor    = 'Top, Bottom, Left'
+  $pad.Controls.Add($accent)
+
+  # Pencil (edit) button, pinned to the far right of the line.
+  $edit = New-Object System.Windows.Forms.Label
+  $edit.UseCompatibleTextRendering = $true
+  $edit.Font      = New-IconFont ([single]($rowPt * 0.95))
+  $edit.Text      = Get-IconChar $script:MAT.edit 0x270E
+  $edit.ForeColor = [System.Drawing.Color]::FromArgb(130, 130, 140)
+  $edit.BackColor = [System.Drawing.Color]::Transparent
+  $edit.AutoSize  = $true
+  $edit.Cursor    = [System.Windows.Forms.Cursors]::Hand
+  $edit.Anchor    = 'Top, Right'
+  $editRight = 14
+  $edit.Location = New-Object System.Drawing.Point(
+    ($pad.Width - $edit.PreferredWidth - $editRight),
+    [int](($pad.Height - $edit.PreferredHeight) / 2))
+  $script:rowTip.SetToolTip($edit, 'Set an objective / title for this project')
+  $pad.Controls.Add($edit)
+  $edit.BringToFront()
+  $edit.Add_MouseEnter({ $this.ForeColor = [System.Drawing.Color]::FromArgb(120, 175, 240) })
+  $edit.Add_MouseLeave({ $this.ForeColor = [System.Drawing.Color]::FromArgb(130, 130, 140) })
+
+  # Project name (small, dim) so the bar reads as "<project>  <objective>".
+  $name = New-Object System.Windows.Forms.Label
+  $name.Text      = $project
+  $name.Font      = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.78), [System.Drawing.FontStyle]::Bold)
+  $name.ForeColor = $grey
+  $name.AutoSize  = $true
+  $name.BackColor = [System.Drawing.Color]::Transparent
+  $name.Location  = New-Object System.Drawing.Point(14, [int](($pad.Height - $name.PreferredHeight) / 2))
+  $pad.Controls.Add($name)
+
+  # The objective itself (the title). Empty -> a dim italic placeholder, so the pencil
+  # stays discoverable while the stored title genuinely stays empty.
+  $obLbl = New-Object System.Windows.Forms.Label
+  $obLbl.AutoSize     = $false
+  $obLbl.TextAlign    = 'MiddleLeft'
+  $obLbl.AutoEllipsis = $true
+  $obLbl.BackColor    = [System.Drawing.Color]::Transparent
+  $obLbl.Cursor       = [System.Windows.Forms.Cursors]::Hand
+  if ($obj) {
+    $obLbl.Text      = $obj
+    $obLbl.ForeColor = $white
+    $obLbl.Font      = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.92), [System.Drawing.FontStyle]::Bold)
+  } else {
+    $obLbl.Text      = 'Set an objective' + [char]0x2026
+    $obLbl.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 120)
+    $obLbl.Font      = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.88), [System.Drawing.FontStyle]::Italic)
+  }
+  $obX = $name.Location.X + $name.PreferredWidth + 12
+  $obLbl.Location = New-Object System.Drawing.Point($obX, 0)
+  $obLbl.Size     = New-Object System.Drawing.Size(
+    [math]::Max(10, $pad.Width - $obX - ($edit.PreferredWidth + $editRight + 12)), $pad.Height)
+  $obLbl.Anchor   = 'Top, Bottom, Left, Right'
+  $pad.Controls.Add($obLbl)
+
+  # Pencil and title both open the editor; on save, force a rebuild so the new title shows.
+  $openEditor = {
+    $new = Prompt-Objective $project
+    if ($null -ne $new) { Set-Objective $project $new; $script:lastSig = $null; Refresh-List }
+  }.GetNewClosure()
+  $edit.Add_Click($openEditor)
+  $obLbl.Add_Click($openEditor)
+  return $pad
+}
+
+function Make-Row($s, $status, $seen, $promptText, $age, $indent) {
+  if (-not $indent) { $indent = 0 }
   $btn = New-Object System.Windows.Forms.Button
   $btn.FlatStyle = 'Flat'
   $btn.FlatAppearance.MouseOverBackColor = $hover
@@ -876,9 +1096,9 @@ function Make-Row($s, $status, $seen, $promptText, $age) {
   $btn.Image = New-Badge ([string]$s.project) $badgeSize   # coloured square + initials
   $statGap = 12
   $btn.Padding = New-Object System.Windows.Forms.Padding(($script:statBox + $statGap), 0, 18, 0)  # leave room for the status dot
-  $btn.Width  = $list.ClientSize.Width - ($script:listPadX * 2 + 8)
+  $btn.Width  = $list.ClientSize.Width - ($script:listPadX * 2 + 8) - $indent
   $btn.Height = $rowH
-  $btn.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, $rowMargin)
+  $btn.Margin = New-Object System.Windows.Forms.Padding($indent, 0, 0, $rowMargin)
   $btn.TabStop = $false
   $sep = [char]0x2014
   $rest = ('  {0}    {1}    {2}    ({3})' -f $s.project, $sep, $promptText, $age)
@@ -1067,11 +1287,28 @@ $spinTimer.Add_Tick({
   }
 })
 
+# Collapsed-strip heartbeat: smoothly pulse the orange header toward black (and back)
+# while collapsed with an active session. A slow cosine breathe — no flashing — so the
+# thin strip reads as "alive". Reuses Blend-Color; Update-CollapsePulse owns start/stop.
+$script:pulseBlack = [System.Drawing.Color]::FromArgb(10, 10, 12)
+$collapsePulse = New-Object System.Windows.Forms.Timer
+$collapsePulse.Interval = 33
+$collapsePulse.Add_Tick({
+  if (-not $script:collapsed -or -not $script:headerPulseOn) {
+    $collapsePulse.Stop(); $script:headerPulseOn = $false
+    if ($script:collapsed) { $header.BackColor = $script:collapsedBg }
+    return
+  }
+  $k = 0.5 - 0.5 * [math]::Cos(([Environment]::TickCount / 1300.0) * 2 * [math]::PI)   # 0..1
+  $header.BackColor = (Blend-Color $script:collapsedBg $script:pulseBlack (0.55 * $k))
+})
+
 $script:lastSig = $null
 
 function Refresh-List {
   # Apply live preference changes (position + opacity + size).
   Read-Prefs
+  Read-Objectives                       # per-project objectives (used as group titles)
   Update-PosHighlight
   if ($form.Opacity -ne $script:opacity) { $form.Opacity = $script:opacity }
   if ($script:appliedWidthPct -ne $script:widthPct) {
@@ -1127,8 +1364,36 @@ function Refresh-List {
   # Sort: waiting first, then running, then done; newest within each group.
   $rows = @($rows | Sort-Object @{ Expression = 'order' }, @{ Expression = 'upd'; Descending = $true })
 
-  # Anti-flicker: only rebuild when the displayed content actually changed.
-  $sig = ($rows | ForEach-Object { '{0}|{1}|{2}|{3}|{4}' -f $_.s.project, $_.status, $_.p, $_.age, $_.unseenDone }) -join "`n"
+  # Keep the collapsed-strip heartbeat in sync with the live session count (done
+  # before the anti-flicker early-return, so the pulse tracks activity even when the
+  # rendered rows are unchanged).
+  $script:activeCount = @($rows | Where-Object { $_.status -eq 'running' -or $_.status -eq 'waiting' }).Count
+  Update-CollapsePulse
+
+  # Group rows by project: each project becomes an objective header followed by its
+  # session rows, indented beneath it. Group order follows the best (lowest) status
+  # in the group then its newest activity, so a project with a waiting session floats up.
+  $byProject  = @{}
+  $projOrder  = @()
+  foreach ($r in $rows) {
+    $proj = [string]$r.s.project
+    if (-not $byProject.ContainsKey($proj)) { $byProject[$proj] = @(); $projOrder += $proj }
+    $byProject[$proj] += $r
+  }
+  $grpList = foreach ($proj in $projOrder) {
+    $g = @($byProject[$proj])
+    [pscustomobject]@{
+      project = $proj
+      rows    = @($g | Sort-Object @{ Expression = 'order' }, @{ Expression = 'upd'; Descending = $true })
+      order   = ($g | Measure-Object -Property order -Minimum).Minimum
+      upd     = (@($g | Sort-Object upd -Descending)[0]).upd
+    }
+  }
+  $grpList = @($grpList | Sort-Object @{ Expression = 'order' }, @{ Expression = 'upd'; Descending = $true })
+
+  # Anti-flicker: only rebuild when the displayed content actually changed. The
+  # objective is part of the signature so editing a title repaints immediately.
+  $sig = ($rows | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.s.project, $_.status, $_.p, $_.age, $_.unseenDone, (Get-Objective ([string]$_.s.project)) }) -join "`n"
   if ($sig -eq $script:lastSig) { return }
   $script:lastSig = $sig
 
@@ -1157,12 +1422,15 @@ function Refresh-List {
     $empty.AutoSize = $true
     $list.Controls.Add($empty)
   } else {
-    foreach ($r in $rows) {
-      $b = Make-Row $r.s $r.status $r.seen $r.p $r.age
-      $list.Controls.Add($b)
-      if ($r.status -eq 'waiting') { $waiting += $b }
-      if ($r.status -eq 'running') { $spinning += $b.Tag }   # $b.Tag = the row's status Label
-      if ($triggerSid -and ([string]$r.s.session_id -eq $triggerSid)) { $triggerBtn = $b }
+    foreach ($grp in $grpList) {
+      $list.Controls.Add((Make-GroupHeader $grp.project))      # objective title + edit pencil
+      foreach ($r in $grp.rows) {
+        $b = Make-Row $r.s $r.status $r.seen $r.p $r.age $script:rowIndent
+        $list.Controls.Add($b)
+        if ($r.status -eq 'waiting') { $waiting += $b }
+        if ($r.status -eq 'running') { $spinning += $b.Tag }   # $b.Tag = the row's status Label
+        if ($triggerSid -and ([string]$r.s.session_id -eq $triggerSid)) { $triggerBtn = $b }
+      }
     }
   }
   $list.ResumeLayout()
@@ -1171,9 +1439,11 @@ function Refresh-List {
   # while collapsed, where the window is intentionally pinned to the header strip.
   if (-not $script:collapsed) {
     $count   = [math]::Max(1, $rows.Count)
-    $desired = $headerH + $listPadV + ($count * ($rowH + $rowMargin)) + 6
+    $grpCount = @($grpList).Count
+    $grpBlock = $script:grpH + $rowMargin + 2                  # one objective header (margin matches Make-GroupHeader)
+    $desired = $headerH + $listPadV + ($count * ($rowH + $rowMargin)) + ($grpCount * $grpBlock) + 6
     $maxH    = [int]($screen.Height * 0.9)
-    $minH    = $headerH + $listPadV + ($rowH + $rowMargin) + 6
+    $minH    = $headerH + $listPadV + ($rowH + $rowMargin) + $grpBlock + 6
     $newH     = [math]::Min($maxH, [math]::Max($minH, $desired))
     $wantTop  = Get-FormTop $newH
     $wantLeft = Get-FormLeft $form.Width
@@ -1200,15 +1470,18 @@ function Refresh-List {
 }
 
 # --- Focus-nudge "Matrix" animation -------------------------------------------
-# When the tray fires a focus nudge it stamps focus-nudge.txt. We run a green
-# digital-rain gag in the deck's top bar (the "Claude Code Sessions" strip) with
-# a one-line wink; it stays up until you CLICK it (then fades out). The taskbar
-# FlashWindowEx fires regardless, and the tray pops the deck open if it was closed.
+# While you're on a distraction the tray keeps focus-nudge.txt fresh. We run a green
+# digital-rain gag in the deck's top bar (the "Claude Code Sessions" strip) with a
+# one-line wink; it stays up the whole time you stay off-track and fades out once you
+# refocus a real app (Check-FocusNudge drives that from the freshness of the stamp).
+# The taskbar FlashWindowEx fires when it first appears, and the tray pops the deck
+# open if it was closed.
 $script:fxCW       = 16     # rain cell width (px)
 $script:fxCH       = 18     # rain cell height (px)
 $script:fxTrailLen = 11     # glyphs per falling column
 $script:fxActive   = $false
 $script:fxFading   = $false # set true on click -> fade out, then stop + hide
+$script:fxSnoozeUntil = 0   # TickCount until which the nudge stays suppressed (set by hovering the deck)
 $script:fxFrame    = 0
 $script:fxAlpha    = 1.0
 $script:fxHeads    = @()
@@ -1241,7 +1514,11 @@ $fx = New-Object System.Windows.Forms.Panel
 $fx.BackColor = [System.Drawing.Color]::Black
 $fx.Visible = $false
 $dbProp.SetValue($fx, $true, $null)   # double-buffer (same trick as the form)
-$fx.Add_Click({ $script:fxFading = $true })   # click anywhere to fade out + dismiss
+# Hovering the deck = "I'm here, let me work": fade the nudge out AND snooze it so it
+# can't instantly snap back from the still-fresh stamp - frees the header for dragging.
+$fxDismiss = { $script:fxFading = $true; $script:fxSnoozeUntil = [Environment]::TickCount + 15000 }
+$fx.Add_MouseEnter($fxDismiss)
+$fx.Add_Click($fxDismiss)
 $fx.Add_Paint({
   param($snd, $e)
   $g = $e.Graphics
@@ -1331,16 +1608,32 @@ function Flash-Deck {
   $script:fxActive = $true
   $fxTimer.Start()
 }
-# Detect a fresh nudge stamp (< 15s old) and flash once per stamp.
+# The tray re-stamps focus-nudge.txt every ~5s WHILE you're on a distraction. Hold
+# the Matrix up the whole time the stamp stays fresh; fade it out once the stamps
+# stop (you refocused a real app). Polled on the 1s Pomodoro timer.
 function Check-FocusNudge {
-  if (-not (Test-Path $nudgeFile)) { return }
-  $val = $null
-  try { $val = ([System.IO.File]::ReadAllText($nudgeFile)).Trim() } catch {}
-  if (-not $val -or $val -eq $script:lastNudgeSeen) { return }
-  $script:lastNudgeSeen = $val
-  $age = 999999
-  try { $age = [Environment]::TickCount - [int]$val } catch {}
-  if ($age -ge 0 -and $age -lt 15000) { Flash-Deck }
+  $fresh = $false
+  if (Test-Path $nudgeFile) {
+    $val = $null
+    try { $val = ([System.IO.File]::ReadAllText($nudgeFile)).Trim() } catch {}
+    if ($val) {
+      $age = 999999
+      try { $age = [Environment]::TickCount - [int]$val } catch {}
+      if ($age -ge 0 -and $age -lt 12000) { $fresh = $true }   # tray stamps every 5s; 12s grace covers a missed tick
+    }
+  }
+  # Hovering the deck snoozes the nudge for a few seconds so you can grab/move the
+  # window without the rain snapping back from the still-fresh stamp.
+  if ([Environment]::TickCount -lt $script:fxSnoozeUntil) {
+    if ($script:fxActive) { $script:fxFading = $true }
+    return
+  }
+  if ($fresh) {
+    if (-not $script:fxActive) { Flash-Deck }                  # first drift -> start the rain
+    else { $script:fxFading = $false; $script:fxAlpha = 1.0 }  # still off-track -> keep it solid until you refocus or hover the deck
+  } elseif ($script:fxActive) {
+    $script:fxFading = $true                                   # stamps stopped -> you refocused -> fade out
+  }
 }
 
 $timer = New-Object System.Windows.Forms.Timer
@@ -1383,7 +1676,7 @@ $clickTimer.Add_Tick({
 $clickTimer.Start()
 
 $form.Add_FormClosed({
-  $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop(); $spinTimer.Stop(); $pomoTimer.Stop(); $pomoPulse.Stop(); $fxTimer.Stop()
+  $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop(); $spinTimer.Stop(); $pomoTimer.Stop(); $pomoPulse.Stop(); $fxTimer.Stop(); $collapsePulse.Stop()
   # Release the single-instance mutex immediately so the next finished task can
   # pop a fresh view without racing this process's shutdown.
   try { $script:viewMutex.ReleaseMutex() } catch {}

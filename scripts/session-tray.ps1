@@ -110,6 +110,13 @@ function Build-Menu {
     Start-Process wscript.exe -ArgumentList ('"{0}"' -f $vbs) -ErrorAction SilentlyContinue
   })
 
+  $rec = $menu.Items.Add('Weekly recap')
+  $rec.ToolTipText = "Summarize this week's work per project (auto-opens every Friday at 17:00)"
+  $rec.Add_Click({
+    $vbs = Join-Path $env:USERPROFILE '.claude\sessions\show-recap.vbs'
+    Start-Process wscript.exe -ArgumentList ('"{0}"' -f $vbs) -ErrorAction SilentlyContinue
+  })
+
   [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
   $quit = $menu.Items.Add('Quit')
@@ -177,17 +184,19 @@ public class HotKeyWindow : NativeWindow {
 # When NO Claude session is active and you've drifted onto a distracting app,
 # Claude - who is bored and rather keen on your projects - pokes you with the
 # gentle chime and a flash of the deck (stamped via focus-nudge.txt, which the
-# deck watches). Opt-in via focus.flag (toggled from the deck's gear menu),
-# silenced by Do-Not-Disturb, and throttled so it never turns into a pest. It
-# reuses the Pomodoro engine's foreground classifier.
+# deck watches). It KEEPS nudging the whole time you stay off-track and only
+# stops once you refocus a real app (VS Code, Unity, a Windows Explorer window -
+# anything that isn't a known distraction). ON by default; opt out via
+# focus-off.flag (toggled from the deck's gear menu), silenced by Do-Not-Disturb.
+# Reuses the Pomodoro engine's foreground classifier.
 # ============================================================================
-$focusFlag      = Join-Path $env:USERPROFILE '.claude\sessions\focus.flag'
+$focusOffFlag   = Join-Path $env:USERPROFILE '.claude\sessions\focus-off.flag'    # presence = nudge DISABLED. The focus nudge is ON by default, so we gate on an opt-OUT marker (toggled from the deck's gear menu).
 $dndFlag        = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'
 $stateDir       = Join-Path $env:USERPROFILE '.claude\sessions\state'
-$nudgeSignal    = Join-Path $env:USERPROFILE '.claude\sessions\focus-nudge.txt'  # tray stamps [Environment]::TickCount here on each nudge; the deck flashes when it's fresh
-$NUDGE_GAP_MS   = 180000   # at most one nudge per 3 minutes
-$ACTIVE_WIN_MIN = 30       # a running/waiting session counts as active only if touched within 30 min
-$script:lastNudge = 0      # [Environment]::TickCount of the last nudge (0 = never)
+$nudgeSignal    = Join-Path $env:USERPROFILE '.claude\sessions\focus-nudge.txt'  # re-stamped with [Environment]::TickCount on EVERY tick while you're on a distraction; the deck holds the Matrix up while the stamp stays fresh and fades it once you refocus a real app
+$CHIME_GAP_MS   = 60000    # audible re-nag at most once per minute (the visual nag is continuous until you refocus)
+$ACTIVE_WIN_SEC = 30       # a running/waiting session counts as active only if touched within 30s (so a stuck/abandoned 'running' stops gating the nudge almost immediately)
+$script:lastChime = 0      # [Environment]::TickCount of the last chime (0 = never)
 
 # A session is "active" (so Claude is NOT bored) when any state file is running or
 # waiting AND was touched recently - a stale 'running' from a dead session must not
@@ -200,31 +209,33 @@ function Any-SessionActive {
       $o = [System.IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json
       $upd = $f.LastWriteTime
       try { $upd = [datetime]$o.updated } catch {}
-      if (($now - $upd).TotalMinutes -gt $ACTIVE_WIN_MIN) { continue }
+      if (($now - $upd).TotalSeconds -gt $ACTIVE_WIN_SEC) { continue }
       if ($o.status -eq 'running' -or $o.status -eq 'waiting') { return $true }
     } catch {}
   }
   return $false
 }
 
-# Every 20s: if enabled, not DND, off cooldown, no active session, and you're on a
-# known distraction -> chime + stamp the signal file (the deck flashes on the stamp).
+# Every 5s: while enabled (default on), not DND, no active session, and you're on a
+# known distraction -> RE-STAMP the signal file on every tick. The deck holds its
+# Matrix overlay up the whole time the stamp stays fresh, so the visual nag is
+# continuous; it fades the moment you refocus a real app (the stamps stop). The
+# chime + reopening a closed deck are throttled to once a minute so it nags without
+# becoming a strobe. The 5s cadence keeps the deck's freshness check current.
 $focusTimer = New-Object System.Windows.Forms.Timer
-$focusTimer.Interval = 20000
+$focusTimer.Interval = 5000
 $focusTimer.Add_Tick({
-  if (-not (Test-Path $focusFlag)) { return }
+  if (Test-Path $focusOffFlag) { return }   # nudge disabled (it's on by default)
   if (Test-Path $dndFlag) { return }
-  if (([Environment]::TickCount - $script:lastNudge) -lt $NUDGE_GAP_MS) { return }
   if (Any-SessionActive) { return }
   $info = Get-PomoCategory
-  if ($info.cat -ne 'distract') { return }
-  $script:lastNudge = [Environment]::TickCount
-  try { Set-Content -LiteralPath $nudgeSignal -Value $script:lastNudge -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+  if ($info.cat -ne 'distract') { return }  # refocusing VS Code / Unity / Explorer (or any non-distraction) lets the stamp go stale -> the deck fades the nudge
+  $now = [Environment]::TickCount
+  try { Set-Content -LiteralPath $nudgeSignal -Value $now -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+  # Audible re-nag + reopen a closed deck, at most once a minute (the visual is continuous).
+  if (($now - $script:lastChime) -lt $CHIME_GAP_MS) { return }
+  $script:lastChime = $now
   Play-PomoChime
-  # If the deck is closed there'd be nothing to shake you - pop it so the Matrix
-  # animation can play. The deck reads the (just-written) stamp on startup and, if
-  # it's fresh, runs the gag immediately. If the deck is already open we leave it
-  # be (its own poll plays the animation) so we don't yank focus needlessly.
   try {
     $deckOpen = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
       Where-Object { $_.CommandLine -like '*session-view.ps1*' }).Count -gt 0
@@ -235,6 +246,86 @@ $focusTimer.Add_Tick({
   } catch {}
 })
 $focusTimer.Start()
+
+# ============================================================================
+# Distraction time tracker
+# Independently of the nudge (and of whether a session is running), sample the
+# foreground every 15s and bank any time spent on a known distraction. The tally
+# is flushed to events.jsonl as a 'distract' event (project 'distraction') when
+# you leave the distraction, or at least every 5 min for a long stint - so the
+# stats dashboard can show a "distraction" project = time spent off task. Shares
+# the nudge's on/off switch (focus-off.flag). Reuses the Pomodoro classifier.
+# Best-effort; a logging failure is swallowed.
+# ============================================================================
+$eventsLog          = Get-CDPath 'stats\events.jsonl'
+$cdUtf8             = Get-CDUtf8
+$DISTRACT_SAMPLE_MS = 15000
+$DISTRACT_FLUSH_MS  = 300000   # flush an ongoing stint at least every 5 min (cap loss on crash)
+$script:distractAcc       = 0                          # seconds banked since the last flush
+$script:distractFlushTick = [Environment]::TickCount
+
+function Flush-Distract {
+  if ($script:distractAcc -le 0) { return }
+  try {
+    $line = ([ordered]@{
+      ts = (Get-Date).ToString('o'); ev = 'distract'; id = 'focus'
+      project = 'distraction'; ctx = $null; sec = [int]$script:distractAcc
+    } | ConvertTo-Json -Compress)
+    $dir = Split-Path -Parent $eventsLog
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    for ($i = 0; $i -lt 5; $i++) {
+      try { [System.IO.File]::AppendAllText($eventsLog, $line + "`r`n", $cdUtf8); break }
+      catch { Start-Sleep -Milliseconds 40 }
+    }
+  } catch {}
+  $script:distractAcc = 0
+  $script:distractFlushTick = [Environment]::TickCount
+}
+
+$distractTimer = New-Object System.Windows.Forms.Timer
+$distractTimer.Interval = $DISTRACT_SAMPLE_MS
+$distractTimer.Add_Tick({
+  if (Test-Path $focusOffFlag) { Flush-Distract; return }   # feature off -> bank what we have, stop tracking
+  $cat = 'neutral'
+  try { $cat = (Get-PomoCategory).cat } catch {}
+  if ($cat -eq 'distract') {
+    $script:distractAcc += [int]($DISTRACT_SAMPLE_MS / 1000)
+    if (([Environment]::TickCount - $script:distractFlushTick) -ge $DISTRACT_FLUSH_MS) { Flush-Distract }
+  } else {
+    Flush-Distract   # back on task (or idle) -> bank the stint
+  }
+})
+$distractTimer.Start()
+
+# ============================================================================
+# Weekly recap trigger
+# Every Friday at 17:00, auto-open the weekly recap popup (session-recap.ps1) -
+# once per week. recap-shown.txt holds the Monday-date tag of the week we last
+# popped, so a tray restart (or the 30s tick landing after 17:00) never re-shows
+# it. If the PC was off at 17:00 sharp, it fires at the first tick on/after 17:00
+# that Friday instead - the report still shows the same day. Openable any time
+# from the tray menu ("Weekly recap").
+# ============================================================================
+$recapShownFile = Join-Path $env:USERPROFILE '.claude\sessions\recap-shown.txt'
+function Get-WeekTag([datetime]$d) {
+  # Monday of $d's week, as yyyy-MM-dd - a stable per-week identifier.
+  return $d.Date.AddDays(-((([int]$d.DayOfWeek) + 6) % 7)).ToString('yyyy-MM-dd')
+}
+$recapTimer = New-Object System.Windows.Forms.Timer
+$recapTimer.Interval = 30000
+$recapTimer.Add_Tick({
+  $n = Get-Date
+  if ($n.DayOfWeek -ne [System.DayOfWeek]::Friday) { return }
+  if ($n.TimeOfDay -lt [timespan]'17:00:00') { return }
+  $tag = Get-WeekTag $n
+  $shown = ''
+  try { if (Test-Path $recapShownFile) { $shown = ([System.IO.File]::ReadAllText($recapShownFile)).Trim() } } catch {}
+  if ($shown -eq $tag) { return }
+  try { [System.IO.File]::WriteAllText($recapShownFile, $tag, (New-Object System.Text.UTF8Encoding($false))) } catch {}
+  $vbs = Join-Path $env:USERPROFILE '.claude\sessions\show-recap.vbs'
+  Start-Process wscript.exe -ArgumentList ('"{0}"' -f $vbs) -ErrorAction SilentlyContinue
+})
+$recapTimer.Start()
 
 $hk = New-Object HotKeyWindow
 $hk.add_Pressed({

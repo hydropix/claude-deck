@@ -76,6 +76,48 @@ function Get-TextOn($color) {
   if ($lum -gt 0.58) { return [System.Drawing.Color]::FromArgb(25, 25, 30) } else { return [System.Drawing.Color]::White }
 }
 
+# --- .env settings ----------------------------------------------------------
+# User-editable settings live in ~/.claude/sessions/.env (seeded from .env.example
+# by the installer). Currently only the weekly-recap Ollama config. Returns a
+# hashtable of UPPER-CASE keys, pre-filled with defaults so callers never have to
+# null-check. KEY=VALUE per line; blank lines and #comments ignored; surrounding
+# single/double quotes stripped. Side-effect free (reads the file on each call).
+function Get-CDEnv {
+  $env = @{
+    # Provider: 'ollama' (native /api/generate) or 'openai' (any OpenAI-compatible
+    # /v1/chat/completions endpoint). The LLM_* keys are the generic config used by
+    # both; the legacy OLLAMA_* keys are still honoured as fallbacks (so an existing
+    # .env keeps working). Empty LLM_* default => "unset", falls back to OLLAMA_*.
+    LLM_PROVIDER           = 'ollama'
+    LLM_URL                = ''
+    LLM_MODEL              = ''
+    LLM_API_KEY            = ''
+    LLM_ENABLED            = ''
+    LLM_TIMEOUT            = ''
+    OLLAMA_URL             = 'http://ai_server.mds.com:11434'
+    OLLAMA_MODEL           = 'gemma4:latest'
+    OLLAMA_ENABLED         = 'true'
+    OLLAMA_TIMEOUT         = '60'
+    RECAP_INCLUDE_OUTCOMES = 'true'
+    RECAP_OUTCOME_CHARS    = '250'
+  }
+  try {
+    $f = Get-CDPath '.env'
+    if (Test-Path $f) {
+      foreach ($line in [System.IO.File]::ReadAllLines($f)) {
+        $t = ([string]$line).Trim()
+        if (-not $t -or $t.StartsWith('#')) { continue }
+        $eq = $t.IndexOf('=')
+        if ($eq -lt 1) { continue }
+        $k = $t.Substring(0, $eq).Trim().ToUpper()
+        $v = $t.Substring($eq + 1).Trim().Trim('"').Trim("'")
+        if ($k) { $env[$k] = $v }
+      }
+    }
+  } catch {}
+  return $env
+}
+
 # --- Self-updater bridge ----------------------------------------------------
 # session-update.ps1 does the actual version compare / download; these helpers let
 # the deck and the tray launch it and read its result (update.json) without each

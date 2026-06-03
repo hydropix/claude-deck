@@ -35,16 +35,48 @@ function Invoke-Updater([string]$mode) {
     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $updScript), $mode
   ) -ErrorAction SilentlyContinue
 }
-# Check only when enabled, and at most a couple of times a day (throttled via update.json).
+# Check only when enabled, and at most once an hour. The throttle window (55 min)
+# sits just under the hourly timer so every tick actually re-checks - a freshly
+# published release is then noticed within ~1h instead of being suppressed for 12h.
 function Invoke-UpdateCheckThrottled {
   if (-not (Test-Path $autoUpdFlag)) { return }
   try {
     if (Test-Path $updInfoFile) {
       $j = [System.IO.File]::ReadAllText($updInfoFile) | ConvertFrom-Json
-      if ($j.checked -and ((Get-Date) - [datetime]$j.checked).TotalHours -lt 12) { return }
+      if ($j.checked -and ((Get-Date) - [datetime]$j.checked).TotalMinutes -lt 55) { return }
     }
   } catch {}
   Invoke-Updater '-Check'
+}
+
+# Read update.json -> the parsed object when a newer version is available, else $null.
+function Get-UpdateInfo {
+  try {
+    if (Test-Path $updInfoFile) {
+      $j = [System.IO.File]::ReadAllText($updInfoFile) | ConvertFrom-Json
+      if ($j.available) { return $j }
+    }
+  } catch {}
+  return $null
+}
+
+# Pop a one-shot tray balloon the first time we see a given available version this
+# session, so the user is told without having to open the desk's gear menu. The
+# tray menu (Build-Menu) carries the actual "Install update" action.
+$script:notifiedUpdVer = $null
+function Show-UpdateNotice {
+  $u = Get-UpdateInfo
+  if (-not $u) { return }
+  $ver = [string]$u.latest
+  if ($ver -and $ver -ne $script:notifiedUpdVer) {
+    $script:notifiedUpdVer = $ver
+    try {
+      $notify.BalloonTipTitle = 'ClaudeDeck update available'
+      $notify.BalloonTipText  = ('Version {0} is ready. Open the deck (Win+Alt+C) or the tray menu to install.' -f $ver)
+      $notify.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Info
+      $notify.ShowBalloonTip(8000)
+    } catch {}
+  }
 }
 
 # App icon: prefer the bundled logo.ico (sits next to this script, both in the
@@ -64,9 +96,20 @@ $notify.Visible = $true
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 $notify.ContextMenuStrip = $menu
 
-# The whole tray menu: open the desk, and quit. Nothing else by design.
+# The whole tray menu: open the desk, and quit (plus a prominent install entry
+# when an update is waiting). Nothing else by design.
 function Build-Menu {
   $menu.Items.Clear()
+
+  # Shown only when update.json reports a newer version - mirrors the desk's gear menu.
+  $upd = Get-UpdateInfo
+  if ($upd) {
+    $ui = $menu.Items.Add(("Install update (v{0})" -f $upd.latest))
+    $ui.ForeColor = [System.Drawing.Color]::FromArgb(80, 160, 90)
+    $ui.ToolTipText = "Downloads and runs the latest ClaudeDeck-Setup.cmd from GitHub"
+    $ui.Add_Click({ Invoke-Updater '-Apply' })
+    [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+  }
 
   $big = $menu.Items.Add('Show large view')
   $big.ToolTipText = "Open the deck - sessions and all settings live there (also Win+Alt+C)"
@@ -88,7 +131,8 @@ $updTimer = New-Object System.Windows.Forms.Timer
 $updTimer.Interval = 8000   # first tick ~8s after launch, then switches to hourly
 $updTimer.Add_Tick({
   $updTimer.Interval = 3600000
-  Invoke-UpdateCheckThrottled
+  Show-UpdateNotice            # surface any already-known update (balloon, once per version/session)
+  Invoke-UpdateCheckThrottled  # then maybe launch a fresh check; its result shows next tick / on menu open
 })
 $updTimer.Start()
 

@@ -6,142 +6,15 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 try { [System.Windows.Forms.Application]::SetProcessDPIAware() | Out-Null } catch {}
 
-Add-Type -TypeDefinition @"
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-public class WinFocus {
-  [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc cb, IntPtr l);
-  delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
-  [DllImport("user32.dll")] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
-  [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
-  [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
-  [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
-  [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
-  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
-  [DllImport("user32.dll")] static extern bool AttachThreadInput(uint a, uint b, bool f);
-  [DllImport("user32.dll")] static extern bool BringWindowToTop(IntPtr h);
-  [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
-  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
-  [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
-  [StructLayout(LayoutKind.Sequential)] struct POINT { public int X; public int Y; }
-  const int SW_RESTORE = 9;
-  public static bool FocusByTitle(string needle) {
-    IntPtr found = IntPtr.Zero;
-    EnumWindows(delegate(IntPtr h, IntPtr l) {
-      if (!IsWindowVisible(h)) return true;
-      int len = GetWindowTextLength(h);
-      if (len == 0) return true;
-      StringBuilder sb = new StringBuilder(len + 1);
-      GetWindowText(h, sb, sb.Capacity);
-      string t = sb.ToString();
-      bool isIde = t.IndexOf("Visual Studio Code", StringComparison.OrdinalIgnoreCase) >= 0
-                || t.IndexOf("Cursor", StringComparison.OrdinalIgnoreCase) >= 0;
-      if (isIde && t.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) { found = h; return false; }
-      return true;
-    }, IntPtr.Zero);
-    return RaiseWindow(found);
-  }
-  // Find a top-level window whose title EXACTLY matches (returns hwnd or zero).
-  public static IntPtr FindExact(string title) {
-    IntPtr found = IntPtr.Zero;
-    EnumWindows(delegate(IntPtr h, IntPtr l) {
-      if (!IsWindowVisible(h)) return true;
-      int len = GetWindowTextLength(h);
-      if (len == 0) return true;
-      StringBuilder sb = new StringBuilder(len + 1);
-      GetWindowText(h, sb, sb.Capacity);
-      if (string.Equals(sb.ToString(), title, StringComparison.OrdinalIgnoreCase)) { found = h; return false; }
-      return true;
-    }, IntPtr.Zero);
-    return found;
-  }
-  public static bool RaiseWindow(IntPtr found) {
-    if (found == IntPtr.Zero) return false;
-    if (IsIconic(found)) ShowWindow(found, SW_RESTORE);  // only un-minimize; never resize a maximized/normal window
-    uint pid; uint fg = GetWindowThreadProcessId(GetForegroundWindow(), out pid);
-    uint cur = GetCurrentThreadId();
-    AttachThreadInput(cur, fg, true);
-    BringWindowToTop(found);
-    SetForegroundWindow(found);
-    AttachThreadInput(cur, fg, false);
-    return true;
-  }
-  public static bool AnyMouseDown() {
-    return ((GetAsyncKeyState(0x01) & 0x8000) != 0) || ((GetAsyncKeyState(0x02) & 0x8000) != 0);
-  }
-  public static bool CursorOutside(int l, int t, int r, int b) {
-    POINT p; if (!GetCursorPos(out p)) return false;
-    return (p.X < l || p.X > r || p.Y < t || p.Y > b);
-  }
-  // Standard taskbar attention flash (used by the focus nudge).
-  [DllImport("user32.dll")] static extern bool FlashWindowEx(ref FLASHWINFO p);
-  [StructLayout(LayoutKind.Sequential)] struct FLASHWINFO { public uint cbSize; public IntPtr hwnd; public uint dwFlags; public uint uCount; public uint dwTimeout; }
-  public static void Flash(IntPtr h, uint count) {
-    FLASHWINFO fi = new FLASHWINFO();
-    fi.cbSize = (uint)Marshal.SizeOf(fi);
-    fi.hwnd = h; fi.dwFlags = 3 /* FLASHW_ALL */; fi.uCount = count; fi.dwTimeout = 0;
-    FlashWindowEx(ref fi);
-  }
-}
-
-// Documented virtual-desktop API (stable across Windows updates).
-[ComImport, Guid("a5cd92ff-29be-454c-8d04-d82879fb3f1b"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-public interface IVirtualDesktopManager {
-  bool IsWindowOnCurrentVirtualDesktop(IntPtr topLevelWindow);
-  Guid GetWindowDesktopId(IntPtr topLevelWindow);
-  void MoveWindowToDesktop(IntPtr topLevelWindow, ref Guid desktopId);
-}
-
-public class VDesk {
-  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
-  static IVirtualDesktopManager _mgr;
-  static IVirtualDesktopManager Mgr() {
-    if (_mgr == null) {
-      Type t = Type.GetTypeFromCLSID(new Guid("aa509086-5ca9-4c25-8f95-589d3c07b48a"));
-      _mgr = (IVirtualDesktopManager)Activator.CreateInstance(t);
-    }
-    return _mgr;
-  }
-  // Keep the window on whatever desktop the user is currently viewing: if it's
-  // not on the current desktop, move it there. Makes it feel pinned to all
-  // desktops, using only the documented IVirtualDesktopManager.
-  public static void FollowToCurrentDesktop(IntPtr hwnd) {
-    try {
-      var mgr = Mgr();
-      if (mgr.IsWindowOnCurrentVirtualDesktop(hwnd)) return;
-      IntPtr fg = GetForegroundWindow();
-      if (fg == IntPtr.Zero || fg == hwnd) return;
-      Guid id = mgr.GetWindowDesktopId(fg);
-      if (id == Guid.Empty) return;
-      mgr.MoveWindowToDesktop(hwnd, ref id);
-    } catch {}
-  }
-}
-"@
-
-# A Form that NEVER steals the keyboard focus. The deck is an overlay that pops
-# up on task completion, so it must not interrupt whatever you're typing in
-# another window. ShowWithoutActivation skips activation when it's shown;
-# WS_EX_NOACTIVATE also keeps it from grabbing focus if you later click it
-# (rows/buttons/drag still work via their own mouse handlers).
-Add-Type -ReferencedAssemblies 'System.Windows.Forms','System.Drawing' -TypeDefinition @"
-using System;
-using System.Windows.Forms;
-public class NoActivateForm : Form {
-  protected override bool ShowWithoutActivation { get { return true; } }
-  protected override CreateParams CreateParams {
-    get {
-      const int WS_EX_NOACTIVATE = 0x08000000;
-      CreateParams cp = base.CreateParams;
-      cp.ExStyle |= WS_EX_NOACTIVATE;
-      return cp;
-    }
-  }
-}
-"@
+# Shared library + deck-specific partials (dot-sourced into this scope). Order
+# matters: load the WinForms/Drawing assemblies above first, then session-common
+# (paths + colour/updater helpers), then the interop types ([WinFocus]/[VDesk]/
+# [NoActivateForm]), the icon renderer (uses common's colour helpers), and the
+# repo/terminal helpers. See each file's header for what it owns.
+. (Join-Path $PSScriptRoot 'session-common.ps1')
+. (Join-Path $PSScriptRoot 'session-ui-interop.ps1')
+. (Join-Path $PSScriptRoot 'session-ui-icons.ps1')
+. (Join-Path $PSScriptRoot 'session-ui-repo.ps1')
 
 $WindowTitle = 'Claude Code Sessions'
 
@@ -173,11 +46,10 @@ $posYFile    = Join-Path $env:USERPROFILE '.claude\sessions\posy.txt'           
 $opacityFile = Join-Path $env:USERPROFILE '.claude\sessions\opacity.txt'         # 20..100 (window opacity %)
 $sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'            # 30..95 (overall scale; 55 = Normal/1.0, drives width + fonts)
 
-# --- Update / version files (shared with the tray) ---
+# Update toggle + stats launcher (the updater bridge itself - Get-LocalVersion /
+# Invoke-Updater / Get-UpdateInfo - lives in session-common.ps1 and resolves its
+# own paths).
 $autoUpdFlag = Join-Path $env:USERPROFILE '.claude\sessions\autoupdate.flag'
-$updInfoFile = Join-Path $env:USERPROFILE '.claude\sessions\update.json'
-$updScript   = Join-Path $env:USERPROFILE '.claude\sessions\session-update.ps1'
-$verFile     = Join-Path $env:USERPROFILE '.claude\sessions\version.txt'
 $statsVbs    = Join-Path $env:USERPROFILE '.claude\sessions\show-stats.vbs'
 
 # Pomodoro: the tray owns the clock + tracking and writes pomodoro.json; the deck
@@ -201,32 +73,8 @@ try {
   }
 } catch {}
 
-function Get-LocalVersion {
-  try { if (Test-Path $verFile) { return ([System.IO.File]::ReadAllText($verFile)).Trim() } } catch {}
-  return $null
-}
-# Launch a version check / install in a hidden background process (never blocks the UI).
-function Invoke-Updater([string]$mode) {
-  if (-not (Test-Path $updScript)) { return }
-  Start-Process powershell -WindowStyle Hidden -ArgumentList @(
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $updScript), $mode
-  ) -ErrorAction SilentlyContinue
-}
-# Read the last check result -> the parsed object when an update is available, else $null.
-function Get-UpdateInfo {
-  try {
-    if (Test-Path $updInfoFile) {
-      $j = [System.IO.File]::ReadAllText($updInfoFile) | ConvertFrom-Json
-      if ($j.available) { return $j }
-    }
-  } catch {}
-  return $null
-}
-# Toggle a flag file on/off (used by the settings menu checkboxes).
-function Toggle-Flag([string]$path) {
-  if (Test-Path $path) { Remove-Item $path -Force -ErrorAction SilentlyContinue }
-  else { Set-Content -LiteralPath $path -Value '' -Encoding ASCII -ErrorAction SilentlyContinue }
-}
+# Get-LocalVersion / Invoke-Updater / Get-UpdateInfo (the self-updater bridge) and
+# Toggle-Flag now live in session-common.ps1.
 
 # --- Favorite-workspace helpers --------------------------------------------
 # Run the shared helper as a hidden child process - NEVER dot-sourced. Dot-sourcing
@@ -246,69 +94,9 @@ function Get-FavCount {
   return 0
 }
 
-# --- Google Material Icons -------------------------------------------------
-# We bundle MaterialIcons-Regular.ttf (Apache 2.0) next to this script and load
-# it privately (no system install). All deck glyphs — position, gear, close and
-# the per-session status dots — are drawn from it. If the font is missing we
-# fall back to Unicode glyphs in Segoe UI, so the deck still works.
-#   settings e8b8  close e5cd  vertical_align_top/bottom e25a/e258
-#   fiber_manual_record e061 (filled)  radio_button_unchecked e836 (outline)
-$script:MAT = @{ top=0xE25A; bottom=0xE258; settings=0xE8B8; close=0xE5CD;
-                 dotFull=0xE061; dotEmpty=0xE836;
-                 play=0xE037; pause=0xE034; skip=0xE044; replay=0xE042;
-                 collapse=0xE5CE; expand=0xE5CF }   # expand_less / expand_more (chevrons)
-$script:matPfc    = $null
-$script:matFamily = $null
-$matPath = Join-Path $PSScriptRoot 'MaterialIcons-Regular.ttf'
-if (Test-Path $matPath) {
-  try {
-    $script:matPfc = New-Object System.Drawing.Text.PrivateFontCollection
-    $script:matPfc.AddFontFile($matPath)
-    $script:matFamily = $script:matPfc.Families[0]
-  } catch { $script:matFamily = $null }
-}
-$script:iconFamily = if ($script:matFamily) { $script:matFamily } else { New-Object System.Drawing.FontFamily('Segoe UI') }
-
-# A label font for header icons (point-sized, so it scales with the layout).
-# UseCompatibleTextRendering=$true on the label routes through GDI+, which is
-# what makes the privately-loaded font actually render.
-function New-IconFont([single]$pt) {
-  New-Object System.Drawing.Font($script:iconFamily, $pt, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
-}
-# Fallback Unicode glyph for each Material codepoint (used when the font is absent).
-function Get-IconChar([int]$matCode, [int]$fallback) {
-  if ($script:matFamily) { return [string][char]$matCode }
-  return [string][char]$fallback
-}
-# Configure a header Label as an icon (Material codepoint or Unicode fallback).
-function Set-IconLabel($lbl, [int]$matCode, [int]$fallback, [single]$pt) {
-  $lbl.UseCompatibleTextRendering = $true
-  $lbl.Font = New-IconFont $pt
-  $lbl.Text = Get-IconChar $matCode $fallback
-}
-# Render a Material glyph to a transparent bitmap (used for the per-session
-# status dots, so a row can mix the dot's font with the prompt's font, and so
-# the "running" dot can be rotated). $px is the glyph size in pixels.
-function New-MatIcon([int]$matCode, [int]$fallback, [single]$px, $color, [single]$angle = 0) {
-  $box = [int][math]::Ceiling($px * 1.5)
-  $bmp = New-Object System.Drawing.Bitmap($box, $box)
-  $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.SmoothingMode     = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-  $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
-  $g.Clear([System.Drawing.Color]::Transparent)
-  if ($angle -ne 0) {
-    $g.TranslateTransform($box / 2.0, $box / 2.0)
-    $g.RotateTransform($angle)
-    $g.TranslateTransform(-$box / 2.0, -$box / 2.0)
-  }
-  $font = New-Object System.Drawing.Font($script:iconFamily, $px, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
-  $br = New-Object System.Drawing.SolidBrush($color)
-  $sf = New-Object System.Drawing.StringFormat
-  $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
-  $g.DrawString((Get-IconChar $matCode $fallback), $font, $br, (New-Object System.Drawing.RectangleF(0, 0, $box, $box)), $sf)
-  $g.Dispose(); $br.Dispose(); $font.Dispose(); $sf.Dispose()
-  return $bmp
-}
+# Material icon glyphs ($script:MAT codepoints, the private font collection, and
+# New-IconFont / Get-IconChar / Set-IconLabel / New-MatIcon / New-Badge) live in
+# session-ui-icons.ps1, dot-sourced above.
 
 # Preferences (position + opacity + size) are re-read on every refresh so changes
 # from the tray menu apply live without reopening the view.
@@ -444,24 +232,9 @@ $hdrDarkTitle       = [System.Drawing.Color]::FromArgb(28, 16, 2)       # title 
 $script:hdrFg       = $grey    # resting icon colour (grey expanded, dark collapsed)
 $script:hdrTitle    = $white   # title colour       (white expanded, dark collapsed)
 
-# Stable per-project accent colour (hash of the name -> hue).
-function Hue2Rgb($p, $q, $t) {
-  if ($t -lt 0) { $t += 1 }; if ($t -gt 1) { $t -= 1 }
-  if ($t -lt (1.0/6)) { return $p + ($q - $p) * 6 * $t }
-  if ($t -lt 0.5)     { return $q }
-  if ($t -lt (2.0/3)) { return $p + ($q - $p) * ((2.0/3) - $t) * 6 }
-  return $p
-}
-function Get-ProjectColor($name) {
-  if (-not $name) { $name = '?' }
-  $hsh = 0
-  foreach ($c in $name.ToCharArray()) { $hsh = [int](($hsh * 31 + [int]$c) % 360) }
-  $h = $hsh / 360.0; $s = 0.55; $l = 0.62
-  $q = if ($l -lt 0.5) { $l * (1 + $s) } else { $l + $s - $l * $s }
-  $p = 2 * $l - $q
-  $r = Hue2Rgb $p $q ($h + 1.0/3); $g = Hue2Rgb $p $q $h; $b = Hue2Rgb $p $q ($h - 1.0/3)
-  return [System.Drawing.Color]::FromArgb([int]($r * 255), [int]($g * 255), [int]($b * 255))
-}
+# The per-project accent colour / initials / contrasting text helpers
+# (Get-ProjectColor / Get-Initials / Get-TextOn) live in session-common.ps1.
+
 # Context occupied, compact: "117k" — empty string when unknown (old state files).
 # We show raw tokens only (no %), since the model's true context window isn't reliably known.
 function Format-Ctx($s) {
@@ -469,41 +242,6 @@ function Format-Ctx($s) {
   if ($null -eq $tok) { return '' }
   if ([int]$tok -ge 1000) { return '{0}k' -f [int][math]::Round([int]$tok / 1000.0) }
   return [string][int]$tok
-}
-function Get-Initials($name) {
-  if (-not $name) { return '?' }
-  $caps = ($name -creplace '[^A-Z0-9]', '')
-  if ($caps.Length -ge 2) { return $caps.Substring(0, 2) }
-  return ($name.Substring(0, [math]::Min(2, $name.Length))).ToUpper()
-}
-function Get-TextOn($color) {
-  $lum = (0.299 * $color.R + 0.587 * $color.G + 0.114 * $color.B) / 255.0
-  if ($lum -gt 0.58) { return [System.Drawing.Color]::FromArgb(25, 25, 30) } else { return [System.Drawing.Color]::White }
-}
-# A rounded colour swatch with the project initials.
-function New-Badge($name, $size) {
-  $color = Get-ProjectColor $name
-  $bmp = New-Object System.Drawing.Bitmap($size, $size)
-  $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.SmoothingMode    = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-  $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
-  $g.Clear([System.Drawing.Color]::Transparent)
-  $d = [int]($size * 0.42)
-  $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-  $path.AddArc(0, 0, $d, $d, 180, 90)
-  $path.AddArc($size - $d - 1, 0, $d, $d, 270, 90)
-  $path.AddArc($size - $d - 1, $size - $d - 1, $d, $d, 0, 90)
-  $path.AddArc(0, $size - $d - 1, $d, $d, 90, 90)
-  $path.CloseFigure()
-  $brush = New-Object System.Drawing.SolidBrush($color)
-  $g.FillPath($brush, $path)
-  $font = New-Object System.Drawing.Font('Segoe UI', [single]($size * 0.40), [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
-  $tb = New-Object System.Drawing.SolidBrush((Get-TextOn $color))
-  $sf = New-Object System.Drawing.StringFormat
-  $sf.Alignment = 'Center'; $sf.LineAlignment = 'Center'
-  $g.DrawString((Get-Initials $name), $font, $tb, (New-Object System.Drawing.RectangleF(0, 0, $size, $size)), $sf)
-  $g.Dispose(); $brush.Dispose(); $tb.Dispose(); $font.Dispose(); $path.Dispose()
-  return $bmp
 }
 # Mark a session as "seen" (clears the unseen border) by writing into its state file.
 function Set-Seen($sid) {
@@ -1108,99 +846,8 @@ $list.BringToFront()
 # Tooltip shared by every row's ✕ (hide) button.
 $script:rowTip = New-Object System.Windows.Forms.ToolTip
 
-# Resolve a session's git remote to a browsable web URL (or $null). We read
-# .git/config directly rather than spawning git.exe — no console flash, no PATH
-# dependency — walking up from the session's cwd so a sub-directory still resolves,
-# and following the "gitdir:" pointer when .git is a file (worktrees / submodules).
-# git@host:user/repo.git and ssh://git@host/user/repo.git are normalised to https.
-function Get-RepoWebUrl([string]$cwd) {
-  try {
-    if (-not $cwd) { return $null }
-    $dir = $cwd; $gitPath = $null
-    for ($i = 0; $i -lt 8 -and $dir; $i++) {
-      $cand = Join-Path $dir '.git'
-      if (Test-Path $cand) { $gitPath = $cand; break }
-      $parent = Split-Path $dir -Parent
-      if (-not $parent -or $parent -eq $dir) { break }
-      $dir = $parent
-    }
-    if (-not $gitPath) { return $null }
-    # .git is a directory in a normal clone, a file ("gitdir: <path>") in a worktree.
-    if (Test-Path $gitPath -PathType Container) {
-      $configPath = Join-Path $gitPath 'config'
-    } else {
-      $first = (Get-Content -LiteralPath $gitPath -TotalCount 1 -ErrorAction Stop)
-      if ($first -notmatch '^gitdir:\s*(.+)$') { return $null }
-      $gd = $Matches[1].Trim()
-      if (-not [System.IO.Path]::IsPathRooted($gd)) { $gd = Join-Path $dir $gd }
-      $configPath = Join-Path $gd 'config'
-      if (-not (Test-Path $configPath)) {                          # worktree: config lives in the common dir
-        $commondir = Join-Path $gd 'commondir'
-        if (Test-Path $commondir) {
-          $cd = ((Get-Content -LiteralPath $commondir -TotalCount 1).Trim())
-          if (-not [System.IO.Path]::IsPathRooted($cd)) { $cd = Join-Path $gd $cd }
-          $configPath = Join-Path $cd 'config'
-        }
-      }
-    }
-    if (-not (Test-Path $configPath)) { return $null }
-    $cfg = [System.IO.File]::ReadAllText($configPath)
-    # Prefer origin's url; fall back to the first remote url in the file.
-    $url = $null
-    $m = [regex]::Match($cfg, '(?ms)^\[remote "origin"\](.*?)(?=^\[|\Z)')
-    if ($m.Success) {
-      $um = [regex]::Match($m.Groups[1].Value, '(?m)^\s*url\s*=\s*(.+?)\s*$')
-      if ($um.Success) { $url = $um.Groups[1].Value.Trim() }
-    }
-    if (-not $url) {
-      $um = [regex]::Match($cfg, '(?m)^\s*url\s*=\s*(.+?)\s*$')
-      if ($um.Success) { $url = $um.Groups[1].Value.Trim() }
-    }
-    if (-not $url) { return $null }
-    $web = $url
-    if     ($web -match '^git@([^:]+):(.+)$')        { $web = 'https://{0}/{1}' -f $Matches[1], $Matches[2] }
-    elseif ($web -match '^ssh://git@([^/]+)/(.+)$')  { $web = 'https://{0}/{1}' -f $Matches[1], $Matches[2] }
-    $web = $web -replace '\.git/?$', ''
-    if ($web -match '^https?://') { return $web }
-    return $null
-  } catch { return $null }
-}
-
-# A menu label for a known forge, or a generic one for any other https remote.
-function Get-RepoMenuLabel([string]$url) {
-  if ($url -match 'github\.com')    { return 'Open on GitHub' }
-  if ($url -match 'gitlab\.com')    { return 'Open on GitLab' }
-  if ($url -match 'bitbucket\.org') { return 'Open on Bitbucket' }
-  return 'Open repository in browser'
-}
-
-# Host-aware deep links (issues / changes / CI) under a repo web URL. Empty for an
-# unknown forge — the menu then shows only the repo home entry.
-function Get-RepoSubLinks([string]$url) {
-  if ($url -match 'github\.com') {
-    return @(@{ label = 'Issues'; url = "$url/issues" },
-             @{ label = 'Pull requests'; url = "$url/pulls" },
-             @{ label = 'Actions'; url = "$url/actions" })
-  }
-  if ($url -match 'gitlab\.com') {
-    return @(@{ label = 'Issues'; url = "$url/-/issues" },
-             @{ label = 'Merge requests'; url = "$url/-/merge_requests" },
-             @{ label = 'Pipelines'; url = "$url/-/pipelines" })
-  }
-  if ($url -match 'bitbucket\.org') {
-    return @(@{ label = 'Issues'; url = "$url/issues" },
-             @{ label = 'Pull requests'; url = "$url/pull-requests" },
-             @{ label = 'Pipelines'; url = "$url/pipelines" })
-  }
-  return @()
-}
-
-# Open a terminal at $cwd: prefer Windows Terminal, fall back to PowerShell.
-function Open-Terminal([string]$cwd) {
-  if (-not $cwd -or -not (Test-Path -LiteralPath $cwd)) { return }
-  try { Start-Process wt.exe -ArgumentList ('-d "{0}"' -f $cwd) -ErrorAction Stop }
-  catch { Start-Process powershell.exe -WorkingDirectory $cwd -ErrorAction SilentlyContinue }
-}
+# Get-RepoWebUrl / Get-RepoMenuLabel / Get-RepoSubLinks (the row's repo links) and
+# Open-Terminal live in session-ui-repo.ps1, dot-sourced above.
 
 function Make-Row($s, $status, $seen, $promptText, $age) {
   $btn = New-Object System.Windows.Forms.Button

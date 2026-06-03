@@ -9,9 +9,13 @@ param([switch]$Print)
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-$sessionsDir = Join-Path $env:USERPROFILE '.claude\sessions'
-$statsDir    = Join-Path $sessionsDir 'stats'
-$logFile     = Join-Path $statsDir 'events.jsonl'
+# Shared helpers (paths + the per-project colour/badge functions). Dot-sourcing
+# only DEFINES the functions; their System.Drawing bodies run later, at paint time,
+# once the assemblies below are loaded.
+. (Join-Path $PSScriptRoot 'session-common.ps1')
+
+$statsDir = Get-CDPath 'stats'
+$logFile  = Join-Path $statsDir 'events.jsonl'
 
 # --- Data ------------------------------------------------------------------
 
@@ -204,34 +208,8 @@ $green  = [System.Drawing.Color]::FromArgb(80, 220, 130)
 $orange = [System.Drawing.Color]::FromArgb(245, 175, 70)
 $accent = [System.Drawing.Color]::FromArgb(110, 165, 240)
 
-# Per-project accent colour + initials badge (same hashing as the view).
-function Hue2Rgb($p, $q, $t) {
-  if ($t -lt 0) { $t += 1 }; if ($t -gt 1) { $t -= 1 }
-  if ($t -lt (1.0/6)) { return $p + ($q - $p) * 6 * $t }
-  if ($t -lt 0.5)     { return $q }
-  if ($t -lt (2.0/3)) { return $p + ($q - $p) * ((2.0/3) - $t) * 6 }
-  return $p
-}
-function Get-ProjectColor($name) {
-  if (-not $name) { $name = '?' }
-  $hsh = 0
-  foreach ($c in $name.ToCharArray()) { $hsh = [int](($hsh * 31 + [int]$c) % 360) }
-  $h = $hsh / 360.0; $s = 0.55; $l = 0.62
-  $q = if ($l -lt 0.5) { $l * (1 + $s) } else { $l + $s - $l * $s }
-  $p = 2 * $l - $q
-  $r = Hue2Rgb $p $q ($h + 1.0/3); $g = Hue2Rgb $p $q $h; $b = Hue2Rgb $p $q ($h - 1.0/3)
-  return [System.Drawing.Color]::FromArgb([int]($r * 255), [int]($g * 255), [int]($b * 255))
-}
-function Get-Initials($name) {
-  if (-not $name) { return '?' }
-  $caps = ($name -creplace '[^A-Z0-9]', '')
-  if ($caps.Length -ge 2) { return $caps.Substring(0, 2) }
-  return ($name.Substring(0, [math]::Min(2, $name.Length))).ToUpper()
-}
-function Get-TextOn($color) {
-  $lum = (0.299 * $color.R + 0.587 * $color.G + 0.114 * $color.B) / 255.0
-  if ($lum -gt 0.58) { return [System.Drawing.Color]::FromArgb(25, 25, 30) } else { return [System.Drawing.Color]::White }
-}
+# Per-project accent colour + initials badge: Get-ProjectColor / Get-Initials /
+# Get-TextOn now live in session-common.ps1 (shared with the deck).
 
 # --- Sizing relative to the primary screen (looks right at any resolution) ---
 $screen  = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea

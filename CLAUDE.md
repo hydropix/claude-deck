@@ -19,26 +19,67 @@ Claude Code  --(hooks: UserPromptSubmit/Stop/Notification/SessionEnd)-->  sessio
    session-stats.ps1 (dashboard)     ----reads events---> activity / focus-time charts
 ```
 
-Scripts under `scripts/` and their roles:
+Scripts under `scripts/` are split into **entry points** (run directly / by a launcher) and
+**dot-sourced modules** (libraries loaded into an entry point's scope; never run on their own).
+
+**Entry points:**
 
 - **session-tracker.ps1** — the only thing hooks call. Takes `-Event prompt|stop|notify|end`,
   reads the hook's JSON payload from stdin, and writes the session's state file (+ appends to
   `events.jsonl`). It **must never throw into Claude Code**: every path ends in `exit 0` and
   errors are swallowed. It also reads the session transcript to compute context-window tokens.
+  **Deliberately standalone** — it does NOT dot-source the shared library, so a bug there can
+  never break a hook.
 - **session-tray.ps1** — the long-lived tray icon (`NotifyIcon`). Lists active sessions, lets
   you click one to focus its VS Code/Cursor window, and owns all settings toggles (DND,
   transparency, size, auto-update) which it persists as flag/text files. Hosts the global
-  hotkey (Win+Alt+C) that opens the large view. Single-instance via a process scan.
+  hotkey (Win+Alt+C) that opens the large view. Single-instance via a process scan. Dot-sources
+  `session-common.ps1` + `session-pomodoro.ps1`.
 - **session-view.ps1** — the large always-on-top overlay, auto-popped on `Stop` (unless
   `dnd.flag`). Same per-session data as the tray, bigger. Reads `opacity.txt` / `size.txt` live.
+  Dot-sources `session-common.ps1` + `session-ui-interop.ps1` + `session-ui-icons.ps1` +
+  `session-ui-repo.ps1`. The file still owns the form build, layout, row rendering, animations
+  and the focus-nudge "Matrix" effect (one cohesive WinForms window).
 - **session-stats.ps1** — the statistics dashboard. Reads `events.jsonl`, pairs prompt→stop
   events into "turns" to derive focus time, and draws today/week cards, a 14-day activity chart,
   and top projects. Supports `-Print` for a headless text summary (use this to test the math).
+  Dot-sources `session-common.ps1`.
 - **session-update.ps1** — optional self-updater. `-Check` compares the installed `version.txt`
   with the repo's and writes `update.json`; `-Apply` downloads and runs the latest setup `.cmd`.
+  Standalone (a leaf, run as a child process).
+- **session-workspaces.ps1** — favorite-workspace save/restore. Dual-mode: run directly with
+  `-Save`/`-Restore`/`-List`, or dot-sourced. Run as a hidden child process by the deck, NOT
+  dot-sourced into it (its `param()` block + action logic would leak — see its header).
 - **\*.vbs** (`start-tray`, `show-view`, `show-stats`) — thin launchers that run the matching
   `.ps1` via `powershell -WindowStyle Hidden` so there's no console flash. Shortcuts and the
   tray menu always go through these, never the `.ps1` directly.
+
+**Dot-sourced modules** (pure definitions; param-less and side-effect-light so they're safe to
+load into a live WinForms scope — see `session-common.ps1`'s header for the rules):
+
+- **session-common.ps1** — the shared library every UI script loads: the data-layout paths
+  (`Get-CDRoot` / `Get-CDPath`), UTF-8-no-BOM writes (`Get-CDUtf8` / `Write-CDText`), the flag
+  toggle (`Toggle-Flag`), the per-project colour/badge helpers (`Get-ProjectColor` /
+  `Get-Initials` / `Get-TextOn` / `Hue2Rgb`), and the self-updater bridge (`Get-LocalVersion` /
+  `Invoke-Updater` / `Get-UpdateInfo`). Single source of truth for things that used to be
+  copy-pasted across the deck, tray and stats.
+- **session-pomodoro.ps1** — the whole Pomodoro engine + the foreground-activity classifier,
+  loaded by the tray. Runs its own 1s timer, publishes `pomodoro.json`, consumes
+  `pomodoro-cmd.txt`, and exposes `Get-PomoCategory` / `Play-PomoChime` (also used by the tray's
+  focus nudge). The deck only *renders* `pomodoro.json` and writes control tokens.
+- **session-ui-interop.ps1** — the deck's native types: `[WinFocus]` (find/raise IDE windows,
+  global mouse polling, taskbar flash), `[VDesk]` (follow the active virtual desktop) and
+  `[NoActivateForm]` (a Form that never steals keyboard focus). Pure `Add-Type`.
+- **session-ui-icons.ps1** — Material icon font loading + glyph/badge rendering for the deck
+  (`$script:MAT`, `New-IconFont`, `Get-IconChar`, `Set-IconLabel`, `New-MatIcon`, `New-Badge`).
+- **session-ui-repo.ps1** — the row context-menu helpers: resolve a session's git remote to a
+  web URL + host-aware deep links (`Get-RepoWebUrl` / `Get-RepoMenuLabel` / `Get-RepoSubLinks`)
+  and `Open-Terminal`.
+
+Dot-sourcing runs a file in the **caller's** scope, so `$script:` state and `$PSScriptRoot`
+stay shared — that's why the modules can define functions the entry point's controls/timers
+use. All files live flat under `scripts/` (the installer and `build-setup.ps1` copy/embed
+`Get-ChildItem -File` non-recursively, so a subfolder would NOT ship).
 
 ### Data & settings layout (`~/.claude/sessions/`)
 

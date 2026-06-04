@@ -20,7 +20,8 @@ $WindowTitle = 'Claude Code Sessions'
 
 # Single-instance via a named mutex. Exactly one view is alive at a time: if we
 # can't create the mutex, another view already owns it -> pull its window onto THIS
-# desktop (so it never yanks you elsewhere), focus it, and exit. The mutex is
+# desktop (so it never yanks you elsewhere), surface it WITHOUT stealing keyboard
+# focus (re-pop on task completion must never interrupt typing), and exit. The mutex is
 # released the instant this view closes (see FormClosed), so a task finishing right
 # after you close the view still pops a fresh one. The old process-scan guard could
 # mistake a just-closed (still-dying) process for a live instance and silently
@@ -31,7 +32,7 @@ if (-not $mutexCreated) {
   $existing = [WinFocus]::FindExact($WindowTitle)
   if ($existing -ne [System.IntPtr]::Zero) {
     [VDesk]::FollowToCurrentDesktop($existing)
-    [WinFocus]::RaiseWindow($existing)
+    [WinFocus]::SurfaceWindow($existing)   # surface without stealing focus - never interrupt typing
   }
   exit 0
 }
@@ -86,48 +87,84 @@ function Get-FavCount {
   return 0
 }
 
-# --- Per-project objectives ------------------------------------------------
-# A manually-typed objective / title / TODO for a project, shared by ALL of that
-# project's sessions. Stored as { items: { "<project>": "<text>" } } in objectives.json
-# (UTF-8 no BOM via Write-CDText). Re-read on every refresh so an edit shows live.
+# --- Per-project objectives (a scrollable one-line todo list) ---------------
+# Each project carries a manually-typed TODO list, shared by ALL of that project's
+# sessions. Stored as { items: { "<project>": [ { text, done }, ... ] } } in
+# objectives.json (UTF-8 no BOM via Write-CDText). A legacy single string is read
+# as one undone task (see ConvertTo-CDTasks in session-common.ps1), so old files
+# keep working. Re-read on every refresh so an edit shows live.
+#
+# The header bar stays ONE line: it shows a single task at a time plus an "i/n"
+# counter, and the mouse wheel (captured app-wide via [WheelFilter], since the
+# overlay never takes focus) cycles through the list. $script:objSel remembers the
+# scrolled-to index per project (in-memory UI state; survives row rebuilds).
 $objFile = Join-Path $env:USERPROFILE '.claude\sessions\objectives.json'
-$script:objectives = @{}
+$script:objectives = @{}     # project -> @( [pscustomobject]@{ text; done } )
+$script:objSel     = @{}     # project -> selected task index (wheel position)
 function Read-Objectives {
   $script:objectives = @{}
   try {
     if (Test-Path $objFile) {
       $o = [System.IO.File]::ReadAllText($objFile) | ConvertFrom-Json
       if ($o -and $o.items) {
-        foreach ($p in $o.items.PSObject.Properties) { $script:objectives[$p.Name] = [string]$p.Value }
+        foreach ($p in $o.items.PSObject.Properties) { $script:objectives[$p.Name] = @(ConvertTo-CDTasks $p.Value) }
       }
     }
   } catch {}
 }
-function Get-Objective([string]$project) {
-  if (-not $project) { return '' }
-  if ($script:objectives.ContainsKey($project)) { return [string]$script:objectives[$project] }
-  return ''
+function Get-Tasks([string]$project) {
+  if (-not $project) { return @() }
+  if ($script:objectives.ContainsKey($project)) { return @($script:objectives[$project]) }
+  return @()
 }
-# Save (or clear, when blank) a project's objective, then persist the whole map.
-function Set-Objective([string]$project, [string]$text) {
+# The wheel index for a project, clamped to the current task count (wraps).
+function Get-ObjSel([string]$project, [int]$count) {
+  $i = 0
+  if ($script:objSel.ContainsKey($project)) { $i = [int]$script:objSel[$project] }
+  if ($count -le 0) { $i = 0 } else { $i = (($i % $count) + $count) % $count }
+  $script:objSel[$project] = $i
+  return $i
+}
+# First view of a project (no wheel position yet): land on the first STILL-OPEN
+# task so the deck surfaces what's left to do, not a completed/struck one. Once the
+# user scrolls, $script:objSel holds their pick and this leaves it alone. A real
+# function (not a closure) so the $script:objSel write lands in the script scope.
+function Ensure-ObjSel([string]$project) {
+  if (-not $project -or $script:objSel.ContainsKey($project)) { return }
+  $tasks = @(Get-Tasks $project)
+  $def = 0
+  for ($i = 0; $i -lt $tasks.Count; $i++) { if (-not $tasks[$i].done) { $def = $i; break } }
+  $script:objSel[$project] = $def
+}
+# A compact content signature (done-state + text) so an edit elsewhere repaints.
+# The scrolled-to index is deliberately NOT part of it: wheel cycling updates the
+# header in place, so it must not trigger a full row rebuild.
+function Get-ObjSig([string]$project) {
+  $parts = @(Get-Tasks $project | ForEach-Object { ($(if ($_.done) { '1' } else { '0' })) + [string]$_.text })
+  return ($parts -join '~')
+}
+# Save (or clear, when empty) a project's task list, then persist the whole map.
+function Set-Tasks([string]$project, $tasks) {
   if (-not $project) { return }
   Read-Objectives                                      # merge onto the latest on-disk map
-  $text = ([string]$text).Trim()
-  if ($text) { $script:objectives[$project] = $text }
+  $tasks = @($tasks | Where-Object { $_ -and ([string]$_.text).Trim() })
+  if ($tasks.Count -gt 0) { $script:objectives[$project] = @($tasks) }
   elseif ($script:objectives.ContainsKey($project)) { $script:objectives.Remove($project) }
   $items = New-Object psobject
-  foreach ($k in $script:objectives.Keys) { $items | Add-Member -NotePropertyName $k -NotePropertyValue $script:objectives[$k] }
-  try { Write-CDText $objFile ([pscustomobject]@{ items = $items } | ConvertTo-Json -Depth 5) } catch {}
+  foreach ($k in $script:objectives.Keys) {
+    $arr = @($script:objectives[$k] | ForEach-Object { [pscustomobject]@{ text = ([string]$_.text).Trim(); done = [bool]$_.done } })
+    $items | Add-Member -NotePropertyName $k -NotePropertyValue $arr
+  }
+  try { Write-CDText $objFile ([pscustomobject]@{ items = $items } | ConvertTo-Json -Depth 6) } catch {}
 }
 
-# Small modal dialog to type/edit a project's objective. Returns the new text on
-# Save (possibly empty -> clears it) or $null on Cancel. Suppresses the deck's
-# click-outside-close while it's open (same guard as the settings menu).
-function Prompt-Objective([string]$project) {
-  $cur = Get-Objective $project
+# A tiny dark single-line input dialog. Returns the typed text on OK (may be empty)
+# or $null on Cancel. Used by the task editor for Add / Edit. Suppresses the deck's
+# click-outside-close while open (same guard as the settings menu).
+function Read-Line([string]$title, [string]$initial) {
   $script:menuOpen = $true
   $dlg = New-Object System.Windows.Forms.Form
-  $dlg.Text            = 'Objective'
+  $dlg.Text            = $title
   $dlg.FormBorderStyle = 'FixedDialog'
   $dlg.StartPosition   = 'CenterScreen'
   $dlg.TopMost         = $true
@@ -136,46 +173,32 @@ function Prompt-Objective([string]$project) {
   $dlg.ShowInTaskbar   = $false
   $dlg.BackColor       = $bg
   $dlg.ForeColor       = $white
-  $dlg.ClientSize      = New-Object System.Drawing.Size(480, 132)
+  $dlg.ClientSize      = New-Object System.Drawing.Size(480, 96)
   try { if (Test-Path $iconPath) { $dlg.Icon = New-Object System.Drawing.Icon($iconPath) } } catch {}
 
-  $lbl = New-Object System.Windows.Forms.Label
-  $lbl.Text      = ('Objective for ' + $project)
-  $lbl.ForeColor = $grey
-  $lbl.AutoSize  = $true
-  $lbl.Font      = New-Object System.Drawing.Font('Segoe UI', 10)
-  $lbl.Location  = New-Object System.Drawing.Point(16, 14)
-  $dlg.Controls.Add($lbl)
-
   $txt = New-Object System.Windows.Forms.TextBox
-  $txt.Text        = $cur
+  $txt.Text        = [string]$initial
   $txt.BackColor   = $rowBg
   $txt.ForeColor   = $white
   $txt.BorderStyle = 'FixedSingle'
   $txt.Font        = New-Object System.Drawing.Font('Segoe UI', 12)
-  $txt.Location    = New-Object System.Drawing.Point(16, 42)
+  $txt.Location    = New-Object System.Drawing.Point(16, 16)
   $txt.Size        = New-Object System.Drawing.Size(448, 28)
   $txt.MaxLength   = 200
   $dlg.Controls.Add($txt)
 
   $ok = New-Object System.Windows.Forms.Button
-  $ok.Text         = 'Save'
-  $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
-  $ok.FlatStyle    = 'Flat'
-  $ok.ForeColor    = $white
-  $ok.BackColor    = $rowBg
-  $ok.Size         = New-Object System.Drawing.Size(96, 30)
-  $ok.Location     = New-Object System.Drawing.Point(264, 86)
+  $ok.Text = 'OK'; $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+  $ok.FlatStyle = 'Flat'; $ok.ForeColor = $white; $ok.BackColor = $rowBg
+  $ok.Size = New-Object System.Drawing.Size(96, 30)
+  $ok.Location = New-Object System.Drawing.Point(264, 52)
   $dlg.Controls.Add($ok)
 
   $cl = New-Object System.Windows.Forms.Button
-  $cl.Text         = 'Cancel'
-  $cl.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-  $cl.FlatStyle    = 'Flat'
-  $cl.ForeColor    = $grey
-  $cl.BackColor    = $rowBg
-  $cl.Size         = New-Object System.Drawing.Size(96, 30)
-  $cl.Location     = New-Object System.Drawing.Point(368, 86)
+  $cl.Text = 'Cancel'; $cl.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+  $cl.FlatStyle = 'Flat'; $cl.ForeColor = $grey; $cl.BackColor = $rowBg
+  $cl.Size = New-Object System.Drawing.Size(96, 30)
+  $cl.Location = New-Object System.Drawing.Point(368, 52)
   $dlg.Controls.Add($cl)
 
   $dlg.AcceptButton = $ok
@@ -188,6 +211,305 @@ function Prompt-Objective([string]$project) {
   $script:menuOpen = $false
   $script:shownAt  = [Environment]::TickCount   # re-arm the click-outside grace
   if ($res -eq [System.Windows.Forms.DialogResult]::OK) { return $val }
+  return $null
+}
+
+# Forces the next Refresh-List to rebuild (clears the anti-flicker signature). A
+# real function so it works from inside GetNewClosure'd handlers — a $script: write
+# in such a block lands in the closure's own module scope, not the script's.
+function Invalidate-List { $script:lastSig = $null }
+
+# --- Task editor: shared state + operations (driven by Edit-Tasks) ----------
+# The editor's list is driven by these top-level helpers rather than in-place
+# closures so the per-row event handlers (which MUST use GetNewClosure to capture
+# their own row index) can reach the shared state simply by CALLING them: a
+# function runs in the real script scope, so its $script: reads/writes and the
+# $script:MAT glyph lookups resolve correctly (a GetNewClosure'd block would see an
+# empty $script:). All state is (re)set by Edit-Tasks each time it opens.
+$script:etTasks = $null   # the working ArrayList of { text; done }
+$script:etSel   = -1      # selected row index (-1 = none)
+$script:etRows  = @()     # the row panels, parallel to $script:etTasks
+
+# Highlight the selected row: lighter bg + a project-coloured left bar.
+function ET-ApplySel {
+  for ($i = 0; $i -lt $script:etRows.Count; $i++) {
+    $rp = $script:etRows[$i]
+    if ($i -eq $script:etSel) { $rp.BackColor = $script:etRowSel; $rp.Tag.bar.Visible = $true }
+    else { $rp.BackColor = $script:etRowIdle; $rp.Tag.bar.Visible = $false }
+  }
+}
+# Paint a row's checkbox + text from its backing task (done -> green tick + strike).
+function ET-RenderRow($rp) {
+  $m = $rp.Tag
+  $t = $script:etTasks[$m.idx]
+  if ($t.done) {
+    $m.check.Text = Get-IconChar $script:MAT.checkOn 0x2611; $m.check.ForeColor = $green
+    $m.text.Font  = $script:etFontDone; $m.text.ForeColor = $script:etDone
+  } else {
+    $m.check.Text = Get-IconChar $script:MAT.checkOff 0x2610; $m.check.ForeColor = $script:etChkOff
+    $m.text.Font  = $script:etFontTask; $m.text.ForeColor = $white
+  }
+  $m.text.Text = [string]$t.text
+}
+function ET-Footer {
+  $n = $script:etTasks.Count
+  $d = @($script:etTasks | Where-Object { $_.done }).Count
+  if ($n -eq 0) { $script:etFooter.Text = 'No tasks yet' }
+  else { $script:etFooter.Text = ('{0} task{1}' -f $n, $(if ($n -eq 1) { '' } else { 's' })) + (' ' + [char]0x00B7 + ' {0} done' -f $d) }
+}
+function ET-Select([int]$idx) { $script:etSel = $idx; ET-ApplySel }
+function ET-Toggle([int]$idx) {
+  if ($idx -lt 0 -or $idx -ge $script:etTasks.Count) { return }
+  $script:etSel = $idx; ET-ApplySel
+  $script:etTasks[$idx].done = -not [bool]$script:etTasks[$idx].done
+  ET-RenderRow $script:etRows[$idx]
+  ET-Footer
+}
+# Build one row panel (left accent bar + clickable check glyph + task text). The
+# handlers capture $idx via GetNewClosure and just call the ET-* operations.
+function ET-MakeRow([int]$idx) {
+  $rp = New-Object System.Windows.Forms.Panel
+  $rp.Width = $script:etRowW; $rp.Height = 34
+  $rp.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 4)
+  $rp.BackColor = $script:etRowIdle
+  $rp.Cursor = [System.Windows.Forms.Cursors]::Hand
+
+  $bar = New-Object System.Windows.Forms.Panel
+  $bar.Dock = 'Left'; $bar.Width = 3; $bar.BackColor = $script:etProjCol; $bar.Visible = $false
+  $rp.Controls.Add($bar)
+
+  $chk = New-Object System.Windows.Forms.Label
+  $chk.UseCompatibleTextRendering = $true
+  $chk.Font = $script:etFontChk; $chk.AutoSize = $true
+  $chk.BackColor = [System.Drawing.Color]::Transparent; $chk.Cursor = [System.Windows.Forms.Cursors]::Hand
+  $chk.Location = New-Object System.Drawing.Point(13, 7)
+  $rp.Controls.Add($chk)
+
+  $txt = New-Object System.Windows.Forms.Label
+  $txt.AutoSize = $false; $txt.TextAlign = 'MiddleLeft'; $txt.AutoEllipsis = $true
+  $txt.BackColor = [System.Drawing.Color]::Transparent; $txt.Cursor = [System.Windows.Forms.Cursors]::Hand
+  $txt.Location = New-Object System.Drawing.Point(42, 0)
+  $txt.Size = New-Object System.Drawing.Size(($script:etRowW - 42 - 10), 34)
+  $rp.Controls.Add($txt)
+
+  $rp.Tag = @{ bar = $bar; check = $chk; text = $txt; idx = $idx }
+
+  $selectThis = { ET-Select $idx }.GetNewClosure()
+  $rp.Add_Click($selectThis)
+  $txt.Add_Click($selectThis)
+  $txt.Add_DoubleClick({ ET-Edit }.GetNewClosure())
+  $chk.Add_Click({ ET-Toggle $idx }.GetNewClosure())
+  $rp.Add_MouseEnter({ if ($script:etSel -ne $idx) { $this.BackColor = $script:etRowHov } }.GetNewClosure())
+  $rp.Add_MouseLeave({ if ($script:etSel -ne $idx) { $this.BackColor = $script:etRowIdle } }.GetNewClosure())
+
+  ET-RenderRow $rp
+  return $rp
+}
+# Rebuild every row from the backing list, then re-apply selection + footer.
+function ET-Fill([int]$select) {
+  $script:etLst.SuspendLayout()
+  $script:etLst.Controls.Clear()
+  $script:etRows = @()
+  if ($script:etTasks.Count -eq 0) {
+    $empty = New-Object System.Windows.Forms.Label
+    $empty.Text = 'No tasks yet ' + [char]0x2014 + ' click Add to create one'
+    $empty.AutoSize = $true; $empty.ForeColor = $grey
+    $empty.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Italic)
+    $empty.Margin = New-Object System.Windows.Forms.Padding(6, 10, 6, 6)
+    $script:etLst.Controls.Add($empty)
+    $script:etSel = -1
+  } else {
+    for ($i = 0; $i -lt $script:etTasks.Count; $i++) {
+      $rp = ET-MakeRow $i
+      $script:etLst.Controls.Add($rp)
+      $script:etRows += $rp
+    }
+    if ($select -lt 0) { $select = 0 }
+    if ($select -ge $script:etTasks.Count) { $select = $script:etTasks.Count - 1 }
+    $script:etSel = $select
+  }
+  $script:etLst.ResumeLayout()
+  ET-ApplySel
+  ET-Footer
+}
+function ET-Edit {
+  $i = $script:etSel
+  if ($i -lt 0 -or $i -ge $script:etTasks.Count) { return }
+  $v = Read-Line ('Edit task ' + [char]0x2014 + ' ' + $script:etProject) ([string]$script:etTasks[$i].text)
+  if ($null -ne $v -and ([string]$v).Trim()) { $script:etTasks[$i].text = ([string]$v).Trim(); ET-Fill $i }
+}
+function ET-Add {
+  $v = Read-Line ('Add task ' + [char]0x2014 + ' ' + $script:etProject) ''
+  if ($null -ne $v -and ([string]$v).Trim()) {
+    [void]$script:etTasks.Add([pscustomobject]@{ text = ([string]$v).Trim(); done = $false })
+    ET-Fill ($script:etTasks.Count - 1)
+  }
+}
+function ET-Delete {
+  $i = $script:etSel
+  if ($i -lt 0 -or $i -ge $script:etTasks.Count) { return }
+  $script:etTasks.RemoveAt($i); ET-Fill $i
+}
+function ET-Move([int]$dir) {
+  $i = $script:etSel; $j = $i + $dir
+  if ($i -lt 0 -or $j -lt 0 -or $j -ge $script:etTasks.Count) { return }
+  $tmp = $script:etTasks[$i]; $script:etTasks.RemoveAt($i); $script:etTasks.Insert($j, $tmp); ET-Fill $j
+}
+
+# The full task-list editor (opened from the header pencil): add / edit / delete /
+# reorder / toggle-done in one dialog. A custom dark row list (the tick = done) sits
+# left, the action buttons right. Returns the edited task list on Save, or $null on
+# Cancel. Suppresses the click-outside-close while open.
+function Edit-Tasks([string]$project) {
+  $tasks = New-Object System.Collections.ArrayList
+  foreach ($t in (Get-Tasks $project)) { [void]$tasks.Add([pscustomobject]@{ text = [string]$t.text; done = [bool]$t.done }) }
+
+  $script:menuOpen = $true
+  $dlg = New-Object System.Windows.Forms.Form
+  $dlg.Text            = ('Tasks ' + [char]0x2014 + ' ' + $project)
+  $dlg.FormBorderStyle = 'FixedDialog'
+  $dlg.StartPosition   = 'CenterScreen'
+  $dlg.TopMost         = $true
+  $dlg.MaximizeBox     = $false
+  $dlg.MinimizeBox     = $false
+  $dlg.ShowInTaskbar   = $false
+  $dlg.BackColor       = $bg
+  $dlg.ForeColor       = $white
+  $dlg.Font            = New-Object System.Drawing.Font('Segoe UI', 9.75)
+  $dlg.ClientSize      = New-Object System.Drawing.Size(600, 412)
+  try { if (Test-Path $iconPath) { $dlg.Icon = New-Object System.Drawing.Icon($iconPath) } } catch {}
+
+  # --- palette / fonts (read by the ET-* editor helpers via $script:) -------
+  $accent  = Get-CDAccent
+  $projCol = Get-ProjectColor $project
+  $script:etProject  = $project
+  $script:etTasks    = $tasks
+  $script:etProjCol  = $projCol
+  $canvasBg          = [System.Drawing.Color]::FromArgb(20, 20, 24)    # list canvas (rows sit on it)
+  $script:etRowIdle  = $rowBg
+  $script:etRowHov   = [System.Drawing.Color]::FromArgb(46, 46, 54)
+  $script:etRowSel   = [System.Drawing.Color]::FromArgb(58, 58, 70)
+  $script:etChkOff   = [System.Drawing.Color]::FromArgb(140, 140, 150)
+  $script:etDone     = [System.Drawing.Color]::FromArgb(125, 125, 135)
+  $script:etFontTask = New-Object System.Drawing.Font('Segoe UI', 11)
+  $script:etFontDone = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Strikeout)
+  $script:etFontChk  = New-IconFont ([single]13)
+
+  # Project-coloured dot + name, with a usage hint on the right.
+  $dot = New-Object System.Windows.Forms.Label
+  $dot.AutoSize = $false; $dot.Size = New-Object System.Drawing.Size(10, 10)
+  $dot.Location = New-Object System.Drawing.Point(20, 19); $dot.BackColor = $projCol
+  $dlg.Controls.Add($dot)
+  $sub = New-Object System.Windows.Forms.Label
+  $sub.Text = $project; $sub.AutoSize = $true; $sub.ForeColor = $white
+  $sub.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
+  $sub.Location = New-Object System.Drawing.Point(38, 13)
+  $dlg.Controls.Add($sub)
+  $hint = New-Object System.Windows.Forms.Label
+  $hint.Text = 'click ' + [char]0x2610 + ' to tick' + [char]0x2002 + [char]0x00B7 + [char]0x2002 + 'double-click to edit'
+  $hint.AutoSize = $true; $hint.ForeColor = $grey
+  $hint.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+  $dlg.Controls.Add($hint)
+  $hint.Location = New-Object System.Drawing.Point((416 - $hint.PreferredWidth), 18)
+
+  # List canvas: a 1px-bordered wrapper around a scrollable TopDown flow of rows.
+  $wrap = New-Object System.Windows.Forms.Panel
+  $wrap.Location  = New-Object System.Drawing.Point(20, 44)
+  $wrap.Size      = New-Object System.Drawing.Size(396, 328)
+  $wrap.BackColor = [System.Drawing.Color]::FromArgb(60, 60, 70)   # shows as the 1px frame
+  $dlg.Controls.Add($wrap)
+  $lst = New-Object System.Windows.Forms.FlowLayoutPanel
+  $lst.Location      = New-Object System.Drawing.Point(1, 1)
+  $lst.Size          = New-Object System.Drawing.Size(394, 326)
+  $lst.FlowDirection = 'TopDown'
+  $lst.WrapContents  = $false
+  $lst.AutoScroll    = $true
+  $lst.BackColor     = $canvasBg
+  $lst.Padding       = New-Object System.Windows.Forms.Padding(6, 6, 6, 6)
+  $wrap.Controls.Add($lst)
+  $script:etLst  = $lst
+  $script:etRowW = $lst.ClientSize.Width - [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth - 14
+  $script:etSel  = 0
+  $script:etRows = @()
+
+  # --- side buttons --------------------------------------------------------
+  # The style helpers run synchronously at build time, so they stay plain
+  # scriptblocks; all row/list logic lives in the ET-* functions above, which the
+  # button handlers just call (so the real $script: state is reached correctly).
+  $lighten = { param($c, $d) [System.Drawing.Color]::FromArgb([math]::Min(255, $c.R + $d), [math]::Min(255, $c.G + $d), [math]::Min(255, $c.B + $d)) }
+  $styleBtn = {
+    param($b, [string]$kind)
+    $b.FlatStyle = 'Flat'
+    $b.FlatAppearance.BorderSize = 0
+    $b.Font   = New-Object System.Drawing.Font('Segoe UI', 9.75)
+    $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $b.UseVisualStyleBackColor = $false
+    $b.TextAlign = 'MiddleCenter'
+    if ($kind -eq 'accent')     { $base = $accent; $fore = Get-TextOn $accent }
+    elseif ($kind -eq 'danger') { $base = $rowBg;  $fore = [System.Drawing.Color]::FromArgb(232, 124, 112) }
+    elseif ($kind -eq 'muted')  { $base = $rowBg;  $fore = $grey }
+    else                        { $base = $rowBg;  $fore = $white }
+    $b.BackColor = $base; $b.ForeColor = $fore
+    $b.FlatAppearance.MouseOverBackColor = (& $lighten $base 18)
+    $b.FlatAppearance.MouseDownBackColor = (& $lighten $base 30)
+  }
+  $mkBtn = {
+    param([string]$text, [int]$top, [string]$kind)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text
+    $b.Size = New-Object System.Drawing.Size(150, 34)
+    $b.Location = New-Object System.Drawing.Point(432, $top)
+    & $styleBtn $b $kind
+    $dlg.Controls.Add($b)
+    return $b
+  }
+
+  $bAdd = & $mkBtn ([char]0x002B + '  Add')              44  'default'
+  $bEd  = & $mkBtn 'Edit'                                82  'default'
+  $bDel = & $mkBtn 'Delete'                              120 'danger'
+  $bUp  = & $mkBtn ([char]0x2191 + '  Move up')          176 'default'
+  $bDn  = & $mkBtn ([char]0x2193 + '  Move down')        214 'default'
+
+  $bAdd.Add_Click({ ET-Add })
+  $bEd.Add_Click({ ET-Edit })
+  $bDel.Add_Click({ ET-Delete })
+  $bUp.Add_Click({ ET-Move -1 })
+  $bDn.Add_Click({ ET-Move 1 })
+
+  # Footer count, bottom-left, aligned with the Save/Cancel row.
+  $footer = New-Object System.Windows.Forms.Label
+  $footer.AutoSize = $true; $footer.ForeColor = $grey
+  $footer.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+  $footer.Location = New-Object System.Drawing.Point(20, 388)
+  $dlg.Controls.Add($footer)
+  $script:etFooter = $footer
+
+  # Save / Cancel (Save carries the brand accent).
+  $ok = New-Object System.Windows.Forms.Button
+  $ok.Text = 'Save'; $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+  $ok.Size = New-Object System.Drawing.Size(150, 34)
+  $ok.Location = New-Object System.Drawing.Point(432, 300)
+  & $styleBtn $ok 'accent'
+  $dlg.Controls.Add($ok)
+
+  $cl = New-Object System.Windows.Forms.Button
+  $cl.Text = 'Cancel'; $cl.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+  $cl.Size = New-Object System.Drawing.Size(150, 34)
+  $cl.Location = New-Object System.Drawing.Point(432, 338)
+  & $styleBtn $cl 'muted'
+  $dlg.Controls.Add($cl)
+
+  $dlg.AcceptButton = $ok
+  $dlg.CancelButton = $cl
+  ET-Fill 0
+
+  $res = $dlg.ShowDialog()
+  $dlg.Dispose()
+  $script:menuOpen = $false
+  $script:shownAt  = [Environment]::TickCount   # re-arm the click-outside grace
+  if ($res -eq [System.Windows.Forms.DialogResult]::OK) {
+    return @($script:etTasks | ForEach-Object { [pscustomobject]@{ text = [string]$_.text; done = [bool]$_.done } })
+  }
   return $null
 }
 
@@ -285,7 +607,9 @@ function Get-ActiveScreen {
 # monitor yet never end up fully off-screen.
 function Get-FormTop($h) {
   $sc = Get-ActiveScreen
-  $margin = [int][math]::Max(24, $sc.Height * 0.04)
+  # Collapsed, the thin strip sits FLUSH against the real screen edge (the working
+  # area already excludes the taskbar); expanded, it keeps a breathing margin.
+  $margin = if ($script:collapsed) { 0 } else { [int][math]::Max(24, $sc.Height * 0.04) }
   switch ($script:position) {
     'top'    { return [int]($sc.Y + $margin) }
     'bottom' { return [int]($sc.Y + $sc.Height - $h - $margin) }
@@ -811,6 +1135,22 @@ function Get-CollapsedWidth {
   return [int]$w
 }
 
+# Snap the deck's vertical anchor to whichever screen edge (top / bottom) its current
+# position is closest to, and persist it like the position buttons do. Called when
+# collapsing so the thin strip tucks itself against the nearest edge instead of
+# hovering wherever the expanded deck happened to sit (a 'free' vertical spot, or the
+# previously chosen edge). The custom HORIZONTAL spot is untouched — Get-FormLeft still
+# honours $customLeft — so the strip keeps its column and only snaps up/down.
+function Set-NearestEdge {
+  $sc     = Get-ActiveScreen
+  $topGap = $form.Top - $sc.Y
+  $botGap = ($sc.Y + $sc.Height) - ($form.Top + $form.Height)
+  $edge   = if ($topGap -le $botGap) { 'top' } else { 'bottom' }
+  $script:position = $edge
+  try { Set-Content -LiteralPath $posFile -Value $edge -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+  Update-PosHighlight
+}
+
 function Set-Collapsed([bool]$c) {
   $script:collapsed = $c
   $list.Visible = -not $c
@@ -847,6 +1187,9 @@ function Set-Collapsed([bool]$c) {
   $script:collapsedActivePomo = Test-PomoActive
 
   if ($c) {
+    # Snap to the nearest edge BEFORE resizing, while the form still has its expanded
+    # geometry — that's the spot the user is judging "top vs bottom" against.
+    if (-not $script:dragging) { Set-NearestEdge }
     $form.Height = $script:headerH
     $form.Width  = Get-CollapsedWidth
     if (-not $script:dragging) {
@@ -909,6 +1252,29 @@ $script:dragging   = $false
 $script:dragOrigin = $null    # cursor screen position when the drag began
 $script:dragStart  = $null    # window location when the drag began
 $header.Cursor = [System.Windows.Forms.Cursors]::SizeAll
+
+# Drag "ghost" for the collapsed strip. Because the real strip is vertically locked to
+# an edge (it only flips at the screen midpoint), a vertical drag would otherwise look
+# like nothing happens — the user wouldn't guess they can move it to the other side. So
+# while dragging collapsed we show a translucent copy that follows the cursor FREELY
+# (vertical included); the solid strip then jumps to meet it once the midpoint is
+# crossed. Lazily created on first use, hidden otherwise. NoActivateForm so it never
+# steals focus.
+$script:ghost = $null
+function Get-Ghost {
+  if ($null -eq $script:ghost) {
+    $g = New-Object NoActivateForm
+    $g.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+    $g.ShowInTaskbar   = $false
+    $g.TopMost         = $true
+    $g.StartPosition   = [System.Windows.Forms.FormStartPosition]::Manual
+    $g.BackColor       = $script:collapsedBg
+    $g.Opacity         = 0.42
+    $script:ghost = $g
+  }
+  return $script:ghost
+}
+function Hide-Ghost { if ($null -ne $script:ghost -and $script:ghost.Visible) { $script:ghost.Hide() } }
 function Save-CustomPosition {
   $script:customLeft = $form.Left
   $script:customTop  = $form.Top
@@ -929,20 +1295,57 @@ function Do-Drag {
   if (-not $script:dragging) { return }
   $cur = [System.Windows.Forms.Cursor]::Position
   $nx  = $script:dragStart.X + ($cur.X - $script:dragOrigin.X)
+  if ($script:collapsed) {
+    # Collapsed, the strip can't float vertically: it stays glued to an edge and only
+    # flips to the other once its centre crosses the screen's vertical midpoint. The
+    # horizontal still follows the cursor freely. Screen.FromPoint keeps this correct
+    # across monitors. The edge is FLUSH (working area already excludes the taskbar).
+    $sc  = [System.Windows.Forms.Screen]::FromPoint($cur).WorkingArea
+    $ny0 = $script:dragStart.Y + ($cur.Y - $script:dragOrigin.Y)
+    $ny  = if (($ny0 + $form.Height / 2) -lt ($sc.Y + $sc.Height / 2)) { $sc.Y }
+           else { $sc.Y + $sc.Height - $form.Height }
+    $form.Location = New-Object System.Drawing.Point([int]$nx, [int]$ny)
+    # Ghost trails the cursor's true (un-snapped) vertical so the move reads as possible.
+    $g = Get-Ghost
+    if ($g.Size -ne $form.Size) { $g.Size = $form.Size }
+    $g.Location = New-Object System.Drawing.Point([int]$nx, [int]$ny0)
+    if (-not $g.Visible) { $g.Show() }
+    return
+  }
   $ny  = $script:dragStart.Y + ($cur.Y - $script:dragOrigin.Y)
   $form.Location = New-Object System.Drawing.Point([int]$nx, [int]$ny)
 }
 function End-Drag {
   if (-not $script:dragging) { return }
   $script:dragging = $false
+  Hide-Ghost
   # Only persist if it actually moved — a bare click shouldn't switch to 'free'.
   $moved = ([math]::Abs($form.Left - $script:dragStart.X) -gt 3) -or ([math]::Abs($form.Top - $script:dragStart.Y) -gt 3)
-  if ($moved) { Save-CustomPosition }
+  if (-not $moved) { return }
+  if ($script:collapsed) {
+    # Keep the new column (custom horizontal) but record the snapped edge as the real
+    # position (top/bottom), NOT 'free' — so the strip stays flush and an expand later
+    # honours that edge. The form is already snapped, so Set-NearestEdge reads it right.
+    $script:customLeft = $form.Left
+    try { Set-Content -LiteralPath $posXFile -Value $form.Left -Encoding ASCII -ErrorAction SilentlyContinue } catch {}
+    Set-NearestEdge
+    return
+  }
+  Save-CustomPosition
 }
 foreach ($dragSurface in @($header, $title)) {
   $dragSurface.Add_MouseDown({ param($snd, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Start-Drag } })
   $dragSurface.Add_MouseMove({ param($snd, $e) Do-Drag })
   $dragSurface.Add_MouseUp({   param($snd, $e) End-Drag })
+  # Double-click on empty header space (or the title) folds/unfolds the deck — same
+  # toggle as the ▲/▼ button. Cancel the in-flight drag the down/up pair started so a
+  # double-click never registers as a 1px move (which would flip the deck to 'free').
+  $dragSurface.Add_MouseDoubleClick({ param($snd, $e)
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+      $script:dragging = $false; Hide-Ghost
+      Set-Collapsed (-not $script:collapsed)
+    }
+  })
 }
 
 $hint = New-Object System.Windows.Forms.Label
@@ -1005,6 +1408,38 @@ $dbProp.SetValue($list, $true, $null)   # double-buffer the list too
 $form.Controls.Add($list)
 $list.BringToFront()
 
+# --- Mouse-wheel todo cycling ----------------------------------------------
+# The overlay is WS_EX_NOACTIVATE and never takes focus, so neither the form nor its
+# children reliably raise the .NET MouseWheel event. We capture WM_MOUSEWHEEL app-wide
+# via [WheelFilter] (session-ui-interop.ps1): when the cursor is over a project's todo
+# header we cycle that project's task IN PLACE (no rebuild) and consume the scroll;
+# anywhere else we return $false so the session list scrolls natively. The x/y handed
+# in are SCREEN coordinates (the WM_MOUSEWHEEL convention), ready for hit-testing.
+[WheelFilter]::Handler = [Func[int, int, int, bool]] {
+  param([int]$x, [int]$y, [int]$delta)
+  try {
+    # A modal dialog (task editor / input) is open over the deck: let it scroll natively.
+    if ($script:menuOpen) { return $false }
+    $pt = New-Object System.Drawing.Point($x, $y)
+    foreach ($h in $script:objHeaders) {
+      $panel = $h.panel
+      if (-not $panel -or $panel.IsDisposed) { continue }
+      $rect = $panel.RectangleToScreen($panel.ClientRectangle)
+      if (-not $rect.Contains($pt)) { continue }
+      $n = @(Get-Tasks $h.project).Count
+      if ($n -gt 1) {
+        $dir = if ($delta -lt 0) { 1 } else { -1 }   # wheel down = next, up = previous
+        $cur = Get-ObjSel $h.project $n
+        $script:objSel[$h.project] = ((((($cur + $dir) % $n) + $n) % $n))
+        [void](& $h.render)
+      }
+      return $true   # over a header: consume so the list doesn't also scroll
+    }
+  } catch {}
+  return $false
+}
+[System.Windows.Forms.Application]::AddMessageFilter((New-Object WheelFilter))
+
 # $rowH, $rowMargin, $badgeSize, $statPx, $statBox are computed in Compute-Dims.
 
 # Tooltip shared by every row's ✕ (hide) button.
@@ -1013,16 +1448,24 @@ $script:rowTip = New-Object System.Windows.Forms.ToolTip
 # Get-RepoWebUrl / Get-RepoMenuLabel / Get-RepoSubLinks (the row's repo links) and
 # Open-Terminal live in session-ui-repo.ps1, dot-sourced above.
 
-# Per-project objective header: a slim bar above each project's session rows. Carries
-# the manually-typed objective as its title (a dim placeholder when none is set yet),
-# a project-coloured accent on the left, and a pencil button at the FAR right that
-# opens the editor. Clicking the title text opens it too.
+# Live registry of the per-project todo headers, rebuilt on every row rebuild. The
+# app-wide wheel hook ([WheelFilter]) hit-tests the cursor against each entry's panel
+# to decide which project's list to cycle. Each entry carries a 'render' closure that
+# repaints the header in place (counter + checkbox + selected task) without a rebuild.
+$script:objHeaders = @()
+
+# Per-project objective header: a slim ONE-LINE bar above each project's session rows.
+# It shows a single task at a time — an "i/n" counter, a clickable done checkbox, and
+# the task text — with a project-coloured accent on the left and a pencil at the FAR
+# right that opens the full task editor. The mouse wheel (captured app-wide) cycles
+# through the project's tasks; clicking the checkbox toggles the shown task's done;
+# clicking the text (or the pencil) opens the editor.
 function Make-GroupHeader($project) {
-  $obj = Get-Objective $project
+  $hdrBg = [System.Drawing.Color]::FromArgb(30, 30, 36)
   $pad = New-Object System.Windows.Forms.Panel
   $pad.Width     = $list.ClientSize.Width - ($script:listPadX * 2 + 8)
   $pad.Height    = $script:grpH
-  $pad.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 36)
+  $pad.BackColor = $hdrBg
   $pad.Margin    = New-Object System.Windows.Forms.Padding(0, $script:rowMargin, 0, 2)
 
   # Project-coloured accent bar — ties the header to the matching badges below it.
@@ -1047,13 +1490,13 @@ function Make-GroupHeader($project) {
   $edit.Location = New-Object System.Drawing.Point(
     ($pad.Width - $edit.PreferredWidth - $editRight),
     [int](($pad.Height - $edit.PreferredHeight) / 2))
-  $script:rowTip.SetToolTip($edit, 'Set an objective / title for this project')
+  $script:rowTip.SetToolTip($edit, 'Edit this project''s task list')
   $pad.Controls.Add($edit)
   $edit.BringToFront()
   $edit.Add_MouseEnter({ $this.ForeColor = [System.Drawing.Color]::FromArgb(120, 175, 240) })
   $edit.Add_MouseLeave({ $this.ForeColor = [System.Drawing.Color]::FromArgb(130, 130, 140) })
 
-  # Project name (small, dim) so the bar reads as "<project>  <objective>".
+  # Project name (small, dim) so the bar reads as "<project>  i/n  [x] <task>".
   $name = New-Object System.Windows.Forms.Label
   $name.Text      = $project
   $name.Font      = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.78), [System.Drawing.FontStyle]::Bold)
@@ -1063,37 +1506,109 @@ function Make-GroupHeader($project) {
   $name.Location  = New-Object System.Drawing.Point(14, [int](($pad.Height - $name.PreferredHeight) / 2))
   $pad.Controls.Add($name)
 
-  # The objective itself (the title). Empty -> a dim italic placeholder, so the pencil
-  # stays discoverable while the stored title genuinely stays empty.
+  # "i/n" task counter (only shown when there is more than one task to scroll).
+  $cnt = New-Object System.Windows.Forms.Label
+  $cnt.AutoSize  = $true
+  $cnt.Font      = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.72), [System.Drawing.FontStyle]::Regular)
+  $cnt.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 130)
+  $cnt.BackColor = $hdrBg        # opaque so a wheel change repaints over the old value
+  $cnt.Visible   = $false
+  $pad.Controls.Add($cnt)
+
+  # Done checkbox for the currently-shown task (Material glyph; click toggles done).
+  $chkPt = [single]($rowPt * 0.95)
+  $chk = New-Object System.Windows.Forms.Label
+  $chk.UseCompatibleTextRendering = $true
+  $chk.Font      = New-IconFont $chkPt
+  $chk.AutoSize  = $true
+  $chk.BackColor = $hdrBg
+  $chk.Cursor    = [System.Windows.Forms.Cursors]::Hand
+  $chk.Visible   = $false
+  $pad.Controls.Add($chk)
+  $script:rowTip.SetToolTip($chk, 'Toggle this task done')
+
+  # The selected task's text (filled by $render). Empty list -> a dim italic prompt.
   $obLbl = New-Object System.Windows.Forms.Label
   $obLbl.AutoSize     = $false
   $obLbl.TextAlign    = 'MiddleLeft'
   $obLbl.AutoEllipsis = $true
-  $obLbl.BackColor    = [System.Drawing.Color]::Transparent
+  $obLbl.BackColor    = $hdrBg
   $obLbl.Cursor       = [System.Windows.Forms.Cursors]::Hand
-  if ($obj) {
-    $obLbl.Text      = $obj
-    $obLbl.ForeColor = $white
-    $obLbl.Font      = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.92), [System.Drawing.FontStyle]::Bold)
-  } else {
-    $obLbl.Text      = 'Set an objective' + [char]0x2026
-    $obLbl.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 120)
-    $obLbl.Font      = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.88), [System.Drawing.FontStyle]::Italic)
-  }
-  $obX = $name.Location.X + $name.PreferredWidth + 12
-  $obLbl.Location = New-Object System.Drawing.Point($obX, 0)
-  $obLbl.Size     = New-Object System.Drawing.Size(
-    [math]::Max(10, $pad.Width - $obX - ($edit.PreferredWidth + $editRight + 12)), $pad.Height)
-  $obLbl.Anchor   = 'Top, Bottom, Left, Right'
   $pad.Controls.Add($obLbl)
 
-  # Pencil and title both open the editor; on save, force a rebuild so the new title shows.
+  $obPt = [single]($rowPt * 0.92)
+  # Checkbox glyph code points captured as LOCALS: $render is GetNewClosure'd, where
+  # a direct $script:MAT read resolves to the closure's own (empty) module scope.
+  $matChkOn  = $script:MAT.checkOn
+  $matChkOff = $script:MAT.checkOff
+  # Repaint the header for the current task list + scroll position. Re-reads the
+  # live data so it reflects edits/toggles, and lays out counter/checkbox/text from
+  # the name's right edge (their widths vary), leaving room for the pencil.
+  $render = {
+    $tasks = @(Get-Tasks $project)
+    $n     = $tasks.Count
+    Ensure-ObjSel $project                 # default to the first open task on first view
+    $sel   = Get-ObjSel $project $n
+    $x     = $name.Location.X + $name.PreferredWidth + 10
+
+    if ($n -gt 1) {
+      $cnt.Visible  = $true
+      $cnt.Text     = ('{0}/{1}' -f ($sel + 1), $n)
+      $cnt.Location = New-Object System.Drawing.Point($x, [int](($pad.Height - $cnt.PreferredHeight) / 2))
+      $x = $cnt.Location.X + $cnt.PreferredWidth + 8
+    } else { $cnt.Visible = $false }
+
+    if ($n -ge 1) {
+      $t = $tasks[$sel]
+      $chk.Visible   = $true
+      $chk.Text      = if ($t.done) { Get-IconChar $matChkOn 0x2611 } else { Get-IconChar $matChkOff 0x2610 }
+      $chk.ForeColor = if ($t.done) { $green } else { [System.Drawing.Color]::FromArgb(150, 150, 160) }
+      $chk.Location  = New-Object System.Drawing.Point($x, [int](($pad.Height - $chk.PreferredHeight) / 2))
+      $x = $chk.Location.X + $chk.PreferredWidth + 6
+
+      $obLbl.Text = [string]$t.text
+      if ($t.done) {
+        $obLbl.ForeColor = [System.Drawing.Color]::FromArgb(120, 120, 130)
+        $obLbl.Font      = New-Object System.Drawing.Font('Segoe UI', $obPt, [System.Drawing.FontStyle]::Strikeout)
+      } else {
+        $obLbl.ForeColor = $white
+        $obLbl.Font      = New-Object System.Drawing.Font('Segoe UI', $obPt, [System.Drawing.FontStyle]::Bold)
+      }
+    } else {
+      $chk.Visible     = $false
+      $obLbl.Text      = 'Add a task' + [char]0x2026
+      $obLbl.ForeColor = [System.Drawing.Color]::FromArgb(110, 110, 120)
+      $obLbl.Font      = New-Object System.Drawing.Font('Segoe UI', [single]($rowPt * 0.88), [System.Drawing.FontStyle]::Italic)
+    }
+    $obLbl.Location = New-Object System.Drawing.Point($x, 0)
+    $obLbl.Size     = New-Object System.Drawing.Size(
+      [math]::Max(10, $pad.Width - $x - ($edit.PreferredWidth + $editRight + 12)), $pad.Height)
+    $pad.Invalidate()   # clear any area a width change vacated (belt-and-braces vs ghosting)
+  }.GetNewClosure()
+
+  # Checkbox toggles the shown task's done state; persist + repaint in place. Mark
+  # the signature dirty so any other refresh path reflects the new state.
+  $chk.Add_Click({
+    $tasks = @(Get-Tasks $project)
+    $n = $tasks.Count
+    if ($n -lt 1) { return }
+    $sel = Get-ObjSel $project $n
+    $tasks[$sel].done = -not [bool]$tasks[$sel].done
+    Set-Tasks $project $tasks
+    Invalidate-List
+    & $render
+  }.GetNewClosure())
+
+  # Pencil and task text both open the full editor; on Save, force a rebuild.
   $openEditor = {
-    $new = Prompt-Objective $project
-    if ($null -ne $new) { Set-Objective $project $new; $script:lastSig = $null; Refresh-List }
+    $new = Edit-Tasks $project
+    if ($null -ne $new) { Set-Tasks $project $new; Invalidate-List; Refresh-List }
   }.GetNewClosure()
   $edit.Add_Click($openEditor)
   $obLbl.Add_Click($openEditor)
+
+  & $render
+  $script:objHeaders += ,([pscustomobject]@{ panel = $pad; project = $project; render = $render })
   return $pad
 }
 
@@ -1421,8 +1936,8 @@ function Refresh-List {
   $grpList = @($grpList | Sort-Object @{ Expression = 'order' }, @{ Expression = 'upd'; Descending = $true })
 
   # Anti-flicker: only rebuild when the displayed content actually changed. The
-  # objective is part of the signature so editing a title repaints immediately.
-  $sig = ($rows | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.s.project, $_.status, $_.p, $_.age, $_.unseenDone, (Get-Objective ([string]$_.s.project)) }) -join "`n"
+  # the task list is part of the signature so editing/toggling repaints immediately.
+  $sig = ($rows | ForEach-Object { '{0}|{1}|{2}|{3}|{4}|{5}' -f $_.s.project, $_.status, $_.p, $_.age, $_.unseenDone, (Get-ObjSig ([string]$_.s.project)) }) -join "`n"
   if ($sig -eq $script:lastSig) { return }
   $script:lastSig = $sig
 
@@ -1440,6 +1955,7 @@ function Refresh-List {
 
   $list.SuspendLayout()
   $list.Controls.Clear()
+  $script:objHeaders = @()   # stale panels are about to be disposed; the wheel hook rebuilds its hit-test set
   $triggerBtn = $null
   $waiting = @()
   $spinning = @()
@@ -1715,6 +2231,7 @@ $clickTimer.Start()
 
 $form.Add_FormClosed({
   $timer.Stop(); $followTimer.Stop(); $animTimer.Stop(); $clickTimer.Stop(); $spinTimer.Stop(); $pomoTimer.Stop(); $pomoPulse.Stop(); $fxTimer.Stop(); $collapsePulse.Stop()
+  try { if ($null -ne $script:ghost) { $script:ghost.Dispose() } } catch {}
   # Release the single-instance mutex immediately so the next finished task can
   # pop a fresh view without racing this process's shutdown.
   try { $script:viewMutex.ReleaseMutex() } catch {}

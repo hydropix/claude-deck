@@ -47,8 +47,8 @@ Scripts under `scripts/` are split into **entry points** (run directly / by a la
 - **session-recap.ps1** — the weekly recap popup, auto-opened by the tray every Friday at 17:00
   (and from the tray's "Weekly recap" menu). Gathers the work week's user requests (Mon 00:00 →
   now) per project by reading the Claude Code transcripts under `~/.claude/projects/<dir>/*.jsonl`,
-  pairs each project with its manual objective from `objectives.json`, and asks an LLM for a short
-  per-project synthesis. The provider is pluggable via `.env` (`Get-CDEnv`): `LLM_PROVIDER=ollama`
+  pairs each project with its **completed** (ticked-done) tasks from `objectives.json` — pending
+  tasks are skipped as noise — and asks an LLM for a short per-project synthesis. The provider is pluggable via `.env` (`Get-CDEnv`): `LLM_PROVIDER=ollama`
   (native `/api/generate`) or `openai` (any OpenAI-compatible `/v1/chat/completions` endpoint). LLM calls run
   in a background runspace, polled by a UI timer so cards fill in as they arrive; if Ollama is off
   or unreachable it falls back to listing the raw requests. `-Print` dumps the gathered data
@@ -112,8 +112,12 @@ these files:
   (`running`/`waiting`/`done`), `updated`, `ctx_tokens`. Overwritten each event; pruned after 24h.
 - `stats/events.jsonl` — append-only history (`{ ts, ev, id, project, ctx }` per line). This is
   what makes trends/durations possible; trimmed to 90 days by the stats view.
-- `objectives.json` — `{ items: { "<project>": "<text>" } }`: the manually-typed per-project
-  objective the deck's group header edits and the weekly recap reads as each card's title.
+- `objectives.json` — `{ items: { "<project>": [ { text, done }, ... ] } }`: the manually-typed
+  per-project TODO list. The deck's group header shows it as a ONE-LINE scrollable todo (mouse
+  wheel cycles tasks, a click toggles the shown task's done, the pencil opens the full add/edit/
+  delete/reorder editor); the weekly recap reads only the ticked-done tasks as "completed". A legacy
+  single `"<text>"` string is still read as one undone task — see `ConvertTo-CDTasks` /
+  `Format-CDObjective` in `session-common.ps1`, the shared normaliser both surfaces use.
 - Flag files (presence = on): `dnd.flag`, `closeoutside.flag`, `autoupdate.flag`.
 - Value files: `opacity.txt` (20–100), `size.txt` (scale), `update.json` (the last `-Check`
   result: `current`/`latest`/`available`/`assetUrl`/`notes`), `update-result.json` (written by

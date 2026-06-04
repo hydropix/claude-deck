@@ -6,6 +6,7 @@
 #   * UTF-8 (no BOM) file writes                       (Get-CDUtf8 / Write-CDText)
 #   * flag-file presence toggle                        (Toggle-Flag)
 #   * per-project accent colour + initials badge       (Get-ProjectColor / Get-Initials / Get-TextOn)
+#   * per-project objective task list normaliser        (ConvertTo-CDTasks)
 #   * the self-updater bridge                          (Get-LocalVersion / Invoke-Updater / Get-UpdateInfo)
 #
 # DOT-SOURCE SAFETY (same rules as session-workspaces.ps1): this file is dot-sourced
@@ -81,6 +82,42 @@ function Get-Initials($name) {
 function Get-TextOn($color) {
   $lum = (0.299 * $color.R + 0.587 * $color.G + 0.114 * $color.B) / 255.0
   if ($lum -gt 0.58) { return [System.Drawing.Color]::FromArgb(25, 25, 30) } else { return [System.Drawing.Color]::White }
+}
+
+# --- Per-project objective tasks -------------------------------------------
+# objectives.json stores, per project, EITHER a legacy single string OR the new
+# task list ( [ { text, done } ] ). Both the deck (the scrollable one-line todo
+# header) and the weekly recap read it, so the normaliser lives here — single
+# source of truth. Returns an array of [pscustomobject]@{ text; done }; a legacy
+# string becomes one undone task; blanks and malformed entries are dropped.
+# (ConvertFrom-Json unwraps a single-element array into a bare object, hence @().)
+# NB: return $out WITHOUT a leading comma. `return ,$out` would survive the @(...)
+# the callers wrap it in as a SINGLE nested element (@(,$out) -> Count 1, [0]=$out),
+# so a 3-task list collapsed to one "task" whose .text was the whole array — the deck
+# header then rendered all texts joined + struck. Plain `return $out` enumerates right.
+function ConvertTo-CDTasks($value) {
+  $out = @()
+  if ($null -eq $value) { return $out }
+  if ($value -is [string]) {
+    $t = ([string]$value).Trim()
+    if ($t) { $out += [pscustomobject]@{ text = $t; done = $false } }
+    return $out
+  }
+  foreach ($it in @($value)) {
+    if ($null -eq $it) { continue }
+    if ($it -is [string]) {
+      $t = ([string]$it).Trim()
+      if ($t) { $out += [pscustomobject]@{ text = $t; done = $false } }
+      continue
+    }
+    $txt = ''
+    try { $txt = ([string]$it.text).Trim() } catch {}
+    if (-not $txt) { continue }
+    $dn = $false
+    try { $dn = [bool]$it.done } catch {}
+    $out += [pscustomobject]@{ text = $txt; done = $dn }
+  }
+  return $out
 }
 
 # --- .env settings ----------------------------------------------------------

@@ -225,12 +225,16 @@ $dndFlag        = Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag'
 $stateDir       = Join-Path $env:USERPROFILE '.claude\sessions\state'
 $nudgeSignal    = Join-Path $env:USERPROFILE '.claude\sessions\focus-nudge.txt'  # re-stamped with [Environment]::TickCount on EVERY tick while you're on a distraction; the deck holds the Matrix up while the stamp stays fresh and fades it once you refocus a real app
 $CHIME_GAP_MS   = 60000    # audible re-nag at most once per minute (the visual nag is continuous until you refocus)
-$ACTIVE_WIN_SEC = 30       # a running/waiting session counts as active only if touched within 30s (so a stuck/abandoned 'running' stops gating the nudge almost immediately)
+$WAITING_WIN_SEC = 30      # a 'waiting' session counts as active only if touched within 30s (a stale 'waiting' must not suppress the nudge forever)
+$RUNNING_WIN_SEC = 21600   # a 'running' session counts as active for up to 6h - the tracker only stamps 'updated' at prompt time, so a long turn keeps no fresh stamp; we trust the running status for the whole turn and let the 6h cap release a crashed/zombie session
 $script:lastChime = 0      # [Environment]::TickCount of the last chime (0 = never)
 
 # A session is "active" (so Claude is NOT bored) when any state file is running or
-# waiting AND was touched recently - a stale 'running' from a dead session must not
-# suppress the nudge forever.
+# waiting. While Claude is WORKING ('running') we don't nudge at all for the whole
+# turn - the tracker only refreshes 'updated' at the start of the turn, so the 30s
+# staleness window would wrongly expire a long running turn and let the nudge fire
+# while Claude is busy. We give 'running' a generous 6h window (zombie backstop) and
+# keep the short 30s window only for 'waiting'.
 function Any-SessionActive {
   if (-not (Test-Path $stateDir)) { return $false }
   $now = Get-Date
@@ -239,8 +243,9 @@ function Any-SessionActive {
       $o = [System.IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json
       $upd = $f.LastWriteTime
       try { $upd = [datetime]$o.updated } catch {}
-      if (($now - $upd).TotalSeconds -gt $ACTIVE_WIN_SEC) { continue }
-      if ($o.status -eq 'running' -or $o.status -eq 'waiting') { return $true }
+      $age = ($now - $upd).TotalSeconds
+      if ($o.status -eq 'running' -and $age -le $RUNNING_WIN_SEC) { return $true }
+      if ($o.status -eq 'waiting' -and $age -le $WAITING_WIN_SEC) { return $true }
     } catch {}
   }
   return $false

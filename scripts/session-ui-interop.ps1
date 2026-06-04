@@ -22,6 +22,7 @@ public class WinFocus {
   [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
   [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int c);
+  [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr h, IntPtr hAfter, int x, int y, int cx, int cy, uint flags);
   [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
@@ -33,6 +34,9 @@ public class WinFocus {
   [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
   [StructLayout(LayoutKind.Sequential)] struct POINT { public int X; public int Y; }
   const int SW_RESTORE = 9;
+  const int SW_SHOWNOACTIVATE = 4;
+  static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+  const uint SWP_NOMOVE = 0x0002, SWP_NOSIZE = 0x0001, SWP_NOACTIVATE = 0x0010, SWP_SHOWWINDOW = 0x0040;
   public static bool FocusByTitle(string needle) {
     IntPtr found = IntPtr.Zero;
     EnumWindows(delegate(IntPtr h, IntPtr l) {
@@ -72,6 +76,16 @@ public class WinFocus {
     BringWindowToTop(found);
     SetForegroundWindow(found);
     AttachThreadInput(cur, fg, false);
+    return true;
+  }
+  // Bring a window to the top of the z-order WITHOUT stealing keyboard focus.
+  // Used when an already-open overlay is re-surfaced on task completion: the user
+  // may be mid-sentence in another app, so we must never activate (which is why we
+  // don't reuse RaiseWindow here - that one intentionally yanks focus for IDE jumps).
+  public static bool SurfaceWindow(IntPtr found) {
+    if (found == IntPtr.Zero) return false;
+    if (IsIconic(found)) ShowWindow(found, SW_SHOWNOACTIVATE);  // un-minimize without activating
+    SetWindowPos(found, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     return true;
   }
   public static bool AnyMouseDown() {
@@ -144,6 +158,30 @@ public class NoActivateForm : Form {
       cp.ExStyle |= WS_EX_NOACTIVATE;
       return cp;
     }
+  }
+}
+
+// Application-wide mouse-wheel hook. The deck is a WS_EX_NOACTIVATE overlay that
+// never takes focus, so neither the form nor its child controls reliably raise the
+// .NET MouseWheel event. Windows' "scroll inactive windows on hover" posts
+// WM_MOUSEWHEEL to whatever window is under the cursor (a child control, usually) —
+// an IMessageFilter sees that message in the pump regardless of focus or target.
+// The PS side assigns Handler := (screenX, screenY, delta) => handled; returning
+// true consumes the scroll (used over a todo header), false lets it fall through
+// (so the session list still scrolls natively). For WM_MOUSEWHEEL the LPARAM x/y
+// are SCREEN coordinates, which is exactly what hit-testing the header wants.
+public class WheelFilter : IMessageFilter {
+  public static Func<int,int,int,bool> Handler;
+  public bool PreFilterMessage(ref Message m) {
+    if (m.Msg == 0x020A && Handler != null) {
+      long w = m.WParam.ToInt64();
+      int delta = (short)((w >> 16) & 0xFFFF);
+      long lp = m.LParam.ToInt64();
+      int x = (short)(lp & 0xFFFF);
+      int y = (short)((lp >> 16) & 0xFFFF);
+      try { return Handler(x, y, delta); } catch { return false; }
+    }
+    return false;
   }
 }
 "@

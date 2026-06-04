@@ -5,8 +5,8 @@
 #   * the developer's requests to Claude this week (read from the Claude Code
 #     transcripts under ~/.claude/projects/<dir>/<session>.jsonl), grouped by the
 #     project (the cwd leaf), filtered to the current work week (Mon 00:00 -> now);
-#   * the manually-typed objective for each project (objectives.json, the same
-#     map the deck's per-project header edits);
+#   * the COMPLETED (ticked-done) tasks for each project (objectives.json, the same
+#     map the deck's per-project header edits) — pending tasks are skipped as noise;
 #   * a clean, short bullet summary produced by an LLM. The provider is pluggable
 #     via ~/.claude/sessions/.env (Get-CDEnv): LLM_PROVIDER=ollama (native) or
 #     'openai' (any OpenAI-compatible /v1/chat/completions endpoint). When the LLM
@@ -168,14 +168,20 @@ if (Test-Path $projectsRoot) {
   }
 }
 
-# Per-project manually-typed objective (same objectives.json the deck header edits).
-$objectives = @{}
+# Per-project COMPLETED tasks (from the same objectives.json the deck edits). We
+# deliberately keep only the ticked-done tasks here: pending / "for later" tasks are
+# noise in a recap of what was actually accomplished. A legacy string objective has
+# no done flag, so it contributes nothing (it isn't "completed").
+$completed = @{}
 try {
   $objFile = Get-CDPath 'objectives.json'
   if (Test-Path $objFile) {
     $oj = [System.IO.File]::ReadAllText($objFile) | ConvertFrom-Json
     if ($oj -and $oj.items) {
-      foreach ($p in $oj.items.PSObject.Properties) { $objectives[$p.Name] = [string]$p.Value }
+      foreach ($p in $oj.items.PSObject.Properties) {
+        $doneTexts = @(ConvertTo-CDTasks $p.Value | Where-Object { $_.done } | ForEach-Object { [string]$_.text })
+        if ($doneTexts.Count -gt 0) { $completed[$p.Name] = ($doneTexts -join '; ') }
+      }
     }
   }
 } catch {}
@@ -196,11 +202,11 @@ foreach ($proj in ($byProject.Keys | Sort-Object { -$byProject[$_].Count })) {
   }
   $block = ($lines -join "`n")
   if ($block.Length -gt $MAX_CHARS) { $block = $block.Substring($block.Length - $MAX_CHARS) }
-  $obj = ''
-  if ($objectives.ContainsKey($proj)) { $obj = $objectives[$proj] }
+  $done = ''
+  if ($completed.ContainsKey($proj)) { $done = $completed[$proj] }
   $projList += [pscustomobject]@{
     project   = $proj
-    objective = $obj
+    completed = $done
     count     = $turns.Count
     turns     = $turns
     prompts   = @($turns | ForEach-Object { $_.q })
@@ -216,7 +222,7 @@ if ($Print) {
   Write-Host ("Projects with activity: {0}`n" -f $projList.Count)
   foreach ($p in $projList) {
     Write-Host ("=== {0}  ({1} request(s)) ===" -f $p.project, $p.count) -ForegroundColor Cyan
-    if ($p.objective) { Write-Host ("Objective: {0}" -f $p.objective) -ForegroundColor Yellow }
+    if ($p.completed) { Write-Host ("Completed: {0}" -f $p.completed) -ForegroundColor Yellow }
     $show = @($p.turns); if ($show.Count -gt 8) { $show = $show[0..7] }
     foreach ($t in $show) {
       $q = if ($t.q.Length -gt 140) { $t.q.Substring(0, 137) + '...' } else { $t.q }
@@ -350,9 +356,9 @@ function New-Card($p) {
   $card.Controls.Add($name); $name.BringToFront()
 
   $y = (PX 32)
-  if ($p.objective) {
+  if ($p.completed) {
     $obj = New-Object System.Windows.Forms.Label
-    $obj.Text = ([char]0x25B8 + ' ' + $p.objective)   # small triangle bullet
+    $obj.Text = ([char]0x2713 + ' ' + $p.completed)   # check mark: tasks completed
     $obj.Font = New-Object System.Drawing.Font('Segoe UI', (9 * $scale), [System.Drawing.FontStyle]::Italic)
     $obj.ForeColor = $blue; $obj.AutoSize = $true; $obj.MaximumSize = New-Object System.Drawing.Size(($cardW - (PX 70)), 0)
     $obj.Location = New-Object System.Drawing.Point((PX 50), $y)
@@ -413,7 +419,7 @@ $timeoutRaw = if ($cfg.LLM_TIMEOUT) { $cfg.LLM_TIMEOUT } else { $cfg.OLLAMA_TIME
 $llmTimeout = 60; try { $llmTimeout = [int]$timeoutRaw } catch {}
 
 function Build-LlmPrompt($p) {
-  $objLine = if ($p.objective) { ('Manually-set objective for this project: "{0}".' -f $p.objective) } else { 'No manual objective was set for this project.' }
+  $objLine = if ($p.completed) { ('Tasks the user ticked as DONE on this project: "{0}". Treat these as confirmed accomplishments.' -f $p.completed) } else { 'No tasks were ticked done on this project.' }
   $outcomeLine = if ($includeOutcomes) { 'Each request may be followed by a "' + [char]0x2192 + '" line: the assistant''s concluding takeaway for that turn (use it to capture what was actually resolved).' } else { '' }
   return @"
 You are writing a concise weekly work recap for the project "$($p.project)".
@@ -527,7 +533,7 @@ function Build-Markdown {
   [void]$sb.AppendLine($rangeLabel); [void]$sb.AppendLine('')
   foreach ($p in $projList) {
     [void]$sb.AppendLine(('## {0}' -f $p.project))
-    if ($p.objective) { [void]$sb.AppendLine(('**Objective:** {0}' -f $p.objective)) }
+    if ($p.completed) { [void]$sb.AppendLine(('**Completed:** {0}' -f $p.completed)) }
     $c = $script:cards[$p.project]
     $txt = if ($c -and $c.rendered) { $c.body.Text } else { (Raw-Summary $p) }
     [void]$sb.AppendLine($txt); [void]$sb.AppendLine('')

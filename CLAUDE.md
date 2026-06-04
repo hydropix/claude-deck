@@ -54,9 +54,21 @@ Scripts under `scripts/` are split into **entry points** (run directly / by a la
   or unreachable it falls back to listing the raw requests. `-Print` dumps the gathered data
   headlessly (test the parsing without UI/LLM); `-Days N` overrides the window. Dot-sources
   `session-common.ps1`.
-- **session-update.ps1** — optional self-updater. `-Check` compares the installed `version.txt`
-  with the repo's and writes `update.json`; `-Apply` downloads and runs the latest setup `.cmd`.
-  Standalone (a leaf, run as a child process).
+- **session-update.ps1** — optional self-updater. Single channel: **GitHub Releases**
+  (the latest release's tag is the canonical version, its attached `ClaudeDeck-Setup.cmd`
+  asset is the payload — so a push to `main` without a release can never serve stale bits).
+  `-Check` queries `releases/latest` (User-Agent header required by the API), compares its
+  tag with the installed `version.txt` (**strictly greater** ⇒ offer the update — a local dev
+  build ahead of the release never nags) and writes `update.json` (incl. `assetUrl`/`notes`).
+  `-Apply` downloads the asset to TEMP, copies **itself** out of the install dir, and relaunches
+  in `-Bootstrap` (detached + hidden), returning immediately so the UI never blocks. `-Bootstrap`
+  is the worker: it **waits for every ClaudeDeck process to exit** (polling until the logo/font
+  handles release — the real failure mode of the old 700ms-sleep design), extracts the installer's
+  silent PS payload from the `.cmd` (after the `#@CDINSTALLER@#` marker — no console, no `pause`),
+  runs it, writes `update-result.json` (`ok`/`version`/`error`) for the restarted tray to surface
+  as a balloon, and restarts the tray itself if the install failed. NB: it must NOT use
+  `Start-Process -Wait` (that blocks on the relaunched tray forever); it uses `-PassThru` +
+  `$p.WaitForExit()`. Standalone (a leaf, run as a child process).
 - **session-workspaces.ps1** — favorite-workspace save/restore. Dual-mode: run directly with
   `-Save`/`-Restore`/`-List`, or dot-sourced. Run as a hidden child process by the deck, NOT
   dot-sourced into it (its `param()` block + action logic would leak — see its header).
@@ -103,7 +115,10 @@ these files:
 - `objectives.json` — `{ items: { "<project>": "<text>" } }`: the manually-typed per-project
   objective the deck's group header edits and the weekly recap reads as each card's title.
 - Flag files (presence = on): `dnd.flag`, `closeoutside.flag`, `autoupdate.flag`.
-- Value files: `opacity.txt` (20–100), `size.txt` (scale), `update.json`, `version.txt`,
+- Value files: `opacity.txt` (20–100), `size.txt` (scale), `update.json` (the last `-Check`
+  result: `current`/`latest`/`available`/`assetUrl`/`notes`), `update-result.json` (written by
+  the updater's `-Bootstrap` worker after an install — `ok`/`version`/`error` — read once by the
+  restarted tray to show a success/failure balloon, then deleted), `version.txt`,
   `recap-shown.txt` (Monday-date tag of the last shown weekly recap, so it fires once/week).
 - `.env` — user-editable settings (seeded once from `.env.example`, never overwritten): the
   weekly-recap LLM config — `LLM_PROVIDER` (`ollama`|`openai`), `LLM_URL`/`LLM_MODEL`/`LLM_API_KEY`
@@ -184,7 +199,10 @@ logic) — never edit it by hand. The version number comes from the latest git t
 
 The git tag is the single source of truth for the version. **Default to a patch bump
 (`0.0.+1`)** — e.g. `v0.1.1` → `v0.1.2` — unless the user asks for a different one. The
-process (the tag drives `version.txt`, which auto-update clients compare against):
+self-updater reads **GitHub Releases** (`releases/latest`), so the final `gh release create`
+(with the `.cmd` attached as an asset) is **mandatory, not optional** — without it, pushing
+to `main` ships nothing to update clients (the tag drives `version.txt`, the published release
+is what `-Check` compares against and `-Apply` downloads):
 
 ```powershell
 git commit ...                     # land your changes first
@@ -195,6 +213,7 @@ git add scripts/version.txt ClaudeDeck-Setup.cmd
 git commit -m "Release v0.1.2: regenerate version.txt and installer from tag"
 git tag -f v0.1.2                  # move the tag onto the release commit
 git push origin main && git push origin v0.1.2
+gh release create v0.1.2 ClaudeDeck-Setup.cmd --title "ClaudeDeck v0.1.2" --notes "..."  # REQUIRED: the updater's channel
 ```
 
 ## Language

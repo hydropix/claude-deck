@@ -71,6 +71,27 @@ function Show-UpdateNotice {
   }
 }
 
+# After an install attempt the -Bootstrap worker leaves update-result.json and
+# restarts us; surface its outcome as a balloon (then clear it so it shows once).
+# This closes the loop the old design lacked: "Install" no longer fails silently.
+function Show-UpdateResult {
+  $r = Get-UpdateResult
+  if (-not $r) { return }
+  Clear-UpdateResult
+  try {
+    if ($r.ok) {
+      $notify.BalloonTipTitle = 'ClaudeDeck updated'
+      $notify.BalloonTipText  = ('Now running v{0}.' -f $r.version)
+      $notify.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Info
+    } else {
+      $notify.BalloonTipTitle = 'ClaudeDeck update failed'
+      $notify.BalloonTipText  = ('Could not install v{0} ({1}). Try again from the tray menu.' -f $r.version, $r.error)
+      $notify.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Warning
+    }
+    $notify.ShowBalloonTip(8000)
+  } catch {}
+}
+
 # App icon: prefer the bundled logo.ico (sits next to this script, both in the
 # repo and once deployed to ~/.claude/sessions); fall back to a system icon.
 function Get-AppIcon {
@@ -98,8 +119,16 @@ function Build-Menu {
   if ($upd) {
     $ui = $menu.Items.Add(("Install update (v{0})" -f $upd.latest))
     $ui.ForeColor = [System.Drawing.Color]::FromArgb(80, 160, 90)
-    $ui.ToolTipText = "Downloads and runs the latest ClaudeDeck-Setup.cmd from GitHub"
-    $ui.Add_Click({ Invoke-Updater '-Apply' })
+    $ui.ToolTipText = "Downloads the latest GitHub release and installs it; the deck restarts automatically"
+    $ui.Add_Click({
+      try {
+        $notify.BalloonTipTitle = 'ClaudeDeck update'
+        $notify.BalloonTipText  = 'Downloading and installing - the deck will restart automatically.'
+        $notify.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Info
+        $notify.ShowBalloonTip(6000)
+      } catch {}
+      Invoke-Updater '-Apply'
+    })
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
   }
 
@@ -130,6 +159,7 @@ $updTimer = New-Object System.Windows.Forms.Timer
 $updTimer.Interval = 8000   # first tick ~8s after launch, then switches to hourly
 $updTimer.Add_Tick({
   $updTimer.Interval = 3600000
+  Show-UpdateResult            # if we were just restarted by an install, report its outcome (once)
   Show-UpdateNotice            # surface any already-known update (balloon, once per version/session)
   Invoke-UpdateCheckThrottled  # then maybe launch a fresh check; its result shows next tick / on menu open
 })

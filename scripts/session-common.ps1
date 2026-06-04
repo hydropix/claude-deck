@@ -152,3 +152,17 @@ function Get-UpdateInfo {
   } catch {}
   return $null
 }
+# The parsed update-result.json written by the -Bootstrap worker after an install
+# attempt (ok / version / error), else $null. The caller deletes the file once it
+# has surfaced the outcome (so it's shown exactly once). This is the feedback loop:
+# clicking "Install" used to be a black box - now the restarted tray reports the result.
+function Get-UpdateResult {
+  try {
+    $f = Get-CDPath 'update-result.json'
+    if (Test-Path $f) { return ([System.IO.File]::ReadAllText($f) | ConvertFrom-Json) }
+  } catch {}
+  return $null
+}
+function Clear-UpdateResult {
+  try { Remove-Item -LiteralPath (Get-CDPath 'update-result.json') -Force -ErrorAction SilentlyContinue } catch {}
+}

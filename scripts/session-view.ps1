@@ -621,7 +621,7 @@ function Build-SettingsMenu {
   if ($upd) {
     $ui = New-Object System.Windows.Forms.ToolStripMenuItem(("Install update (v{0})" -f $upd.latest))
     $ui.ForeColor = [System.Drawing.Color]::FromArgb(80, 160, 90)
-    $ui.ToolTipText = "Downloads and runs the latest ClaudeDeck-Setup.cmd from GitHub"
+    $ui.ToolTipText = "Downloads the latest GitHub release and installs it; the deck restarts automatically (the tray reports the result)"
     $ui.Add_Click({ Invoke-Updater '-Apply' })
     [void]$m.Items.Add($ui)
     [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))

@@ -53,6 +53,7 @@ $sizeFile    = Join-Path $env:USERPROFILE '.claude\sessions\size.txt'           
 $autoUpdFlag = Join-Path $env:USERPROFILE '.claude\sessions\autoupdate.flag'
 $statsVbs    = Join-Path $env:USERPROFILE '.claude\sessions\show-stats.vbs'
 $recapVbs    = Join-Path $env:USERPROFILE '.claude\sessions\show-recap.vbs'
+$onbVbs      = Join-Path $env:USERPROFILE '.claude\sessions\show-onboarding.vbs'   # first-run setup panel (reopenable)
 
 # Pomodoro: the tray owns the clock + tracking and writes pomodoro.json; the deck
 # header just renders it and drops control tokens into pomodoro-cmd.txt.
@@ -98,12 +99,14 @@ function Get-FavCount {
 # counter, and the mouse wheel (captured app-wide via [WheelFilter], since the
 # overlay never takes focus) cycles through the list. $script:objSel remembers the
 # scrolled-to index per project (in-memory UI state; survives row rebuilds).
-$objFile = Join-Path $env:USERPROFILE '.claude\sessions\objectives.json'
+# Resolved via Get-CDObjectivesPath on every read/write, NOT cached: the cloud-sync
+# folder can be set/changed at runtime from the gear menu, so the path must follow it.
 $script:objectives = @{}     # project -> @( [pscustomobject]@{ text; done } )
 $script:objSel     = @{}     # project -> selected task index (wheel position)
 function Read-Objectives {
   $script:objectives = @{}
   try {
+    $objFile = Get-CDObjectivesPath
     if (Test-Path $objFile) {
       $o = [System.IO.File]::ReadAllText($objFile) | ConvertFrom-Json
       if ($o -and $o.items) {
@@ -117,6 +120,14 @@ function Get-Tasks([string]$project) {
   if ($script:objectives.ContainsKey($project)) { return @($script:objectives[$project]) }
   return @()
 }
+# The deck's one-line todo bar shows/cycles ONLY open (not-done) tasks: completed
+# tasks are hidden from the bar entirely and live on only in the editor (pencil) and
+# in objectives.json. Elements are the SAME objects as in Get-Tasks, so toggling one
+# here is reflected in the full list before persisting. The wheel index ($objSel) is
+# an index into THIS filtered list.
+function Get-OpenTasks([string]$project) {
+  return @(Get-Tasks $project | Where-Object { -not $_.done })
+}
 # The wheel index for a project, clamped to the current task count (wraps).
 function Get-ObjSel([string]$project, [int]$count) {
   $i = 0
@@ -125,16 +136,13 @@ function Get-ObjSel([string]$project, [int]$count) {
   $script:objSel[$project] = $i
   return $i
 }
-# First view of a project (no wheel position yet): land on the first STILL-OPEN
-# task so the deck surfaces what's left to do, not a completed/struck one. Once the
-# user scrolls, $script:objSel holds their pick and this leaves it alone. A real
-# function (not a closure) so the $script:objSel write lands in the script scope.
+# First view of a project (no wheel position yet): start at the first open task.
+# The bar only ever shows open tasks (Get-OpenTasks), so index 0 is already the first
+# thing left to do. Once the user scrolls, $script:objSel holds their pick and this
+# leaves it alone. A real function (not a closure) so the write lands in script scope.
 function Ensure-ObjSel([string]$project) {
   if (-not $project -or $script:objSel.ContainsKey($project)) { return }
-  $tasks = @(Get-Tasks $project)
-  $def = 0
-  for ($i = 0; $i -lt $tasks.Count; $i++) { if (-not $tasks[$i].done) { $def = $i; break } }
-  $script:objSel[$project] = $def
+  $script:objSel[$project] = 0
 }
 # A compact content signature (done-state + text) so an edit elsewhere repaints.
 # The scrolled-to index is deliberately NOT part of it: wheel cycling updates the
@@ -155,7 +163,7 @@ function Set-Tasks([string]$project, $tasks) {
     $arr = @($script:objectives[$k] | ForEach-Object { [pscustomobject]@{ text = ([string]$_.text).Trim(); done = [bool]$_.done } })
     $items | Add-Member -NotePropertyName $k -NotePropertyValue $arr
   }
-  try { Write-CDText $objFile ([pscustomobject]@{ items = $items } | ConvertTo-Json -Depth 6) } catch {}
+  try { Write-CDText (Get-CDObjectivesPath) ([pscustomobject]@{ items = $items } | ConvertTo-Json -Depth 6) } catch {}
 }
 
 # A tiny dark single-line input dialog. Returns the typed text on OK (may be empty)
@@ -1059,6 +1067,42 @@ function Build-SettingsMenu {
   $recap.Add_Click({ Start-Process wscript.exe -ArgumentList ('"{0}"' -f $recapVbs) -ErrorAction SilentlyContinue })
   [void]$m.Items.Add($recap)
 
+  # Cloud sync: mirror the todos + activity history to a folder kept in sync across
+  # PCs (Google Drive / OneDrive / Synology Drive). Picking a folder enables it and
+  # seeds it from the current local todos; the tick shows it's on. Other PCs point at
+  # the same folder to share the data. See Get-CDSyncDir / Set-CDSyncDir.
+  $sync = New-Object System.Windows.Forms.ToolStripMenuItem('Cloud sync folder...')
+  $curSync = Get-CDSyncDir
+  $sync.Checked = [bool]$curSync
+  $sync.ToolTipText = if ($curSync) {
+    "Todos + activity history sync via:`n$curSync`nClick to change the folder."
+  } else {
+    "Mirror your todos and activity history to a folder synced across PCs (Google Drive / OneDrive / Synology) so they follow you between machines"
+  }
+  $sync.Add_Click({
+    $script:menuOpen = $true
+    try {
+      $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+      $dlg.Description = 'Pick a folder synced across your PCs (Google Drive / OneDrive / Synology Drive). Your todos and activity history will live there.'
+      $c = Get-CDSyncDir
+      if ($c) { $dlg.SelectedPath = $c }
+      if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        Set-CDSyncDir $dlg.SelectedPath
+        Read-Objectives
+        Invalidate-List
+      }
+      $dlg.Dispose()
+    } catch {}
+    $script:menuOpen = $false
+    $script:shownAt  = [Environment]::TickCount
+  })
+  [void]$m.Items.Add($sync)
+
+  $setup = New-Object System.Windows.Forms.ToolStripMenuItem('Setup / configuration...')
+  $setup.ToolTipText = "Open the setup panel (recap LLM, cloud sync folder, updates, focus)"
+  $setup.Add_Click({ Start-Process wscript.exe -ArgumentList ('"{0}"' -f $onbVbs) -ErrorAction SilentlyContinue })
+  [void]$m.Items.Add($setup)
+
   $envEdit = New-Object System.Windows.Forms.ToolStripMenuItem('Edit recap settings (.env)')
   $envEdit.ToolTipText = "Open the .env file (LLM provider, server URL, model, API key) in Notepad"
   $envEdit.Add_Click({
@@ -1426,7 +1470,7 @@ $list.BringToFront()
       if (-not $panel -or $panel.IsDisposed) { continue }
       $rect = $panel.RectangleToScreen($panel.ClientRectangle)
       if (-not $rect.Contains($pt)) { continue }
-      $n = @(Get-Tasks $h.project).Count
+      $n = @(Get-OpenTasks $h.project).Count
       if ($n -gt 1) {
         $dir = if ($delta -lt 0) { 1 } else { -1 }   # wheel down = next, up = previous
         $cur = Get-ObjSel $h.project $n
@@ -1545,7 +1589,7 @@ function Make-GroupHeader($project) {
   # live data so it reflects edits/toggles, and lays out counter/checkbox/text from
   # the name's right edge (their widths vary), leaving room for the pencil.
   $render = {
-    $tasks = @(Get-Tasks $project)
+    $tasks = @(Get-OpenTasks $project)     # completed tasks are hidden from the bar
     $n     = $tasks.Count
     Ensure-ObjSel $project                 # default to the first open task on first view
     $sel   = Get-ObjSel $project $n
@@ -1586,15 +1630,17 @@ function Make-GroupHeader($project) {
     $pad.Invalidate()   # clear any area a width change vacated (belt-and-braces vs ghosting)
   }.GetNewClosure()
 
-  # Checkbox toggles the shown task's done state; persist + repaint in place. Mark
-  # the signature dirty so any other refresh path reflects the new state.
+  # Ticking the checkbox completes the shown (open) task: it then drops out of the bar
+  # (completed tasks are hidden here — un-tick from the editor). $open holds the SAME
+  # objects as $full, so the done flip is reflected in $full, which we persist.
   $chk.Add_Click({
-    $tasks = @(Get-Tasks $project)
-    $n = $tasks.Count
+    $full = @(Get-Tasks $project)
+    $open = @($full | Where-Object { -not $_.done })
+    $n = $open.Count
     if ($n -lt 1) { return }
     $sel = Get-ObjSel $project $n
-    $tasks[$sel].done = -not [bool]$tasks[$sel].done
-    Set-Tasks $project $tasks
+    $open[$sel].done = $true
+    Set-Tasks $project $full
     Invalidate-List
     & $render
   }.GetNewClosure())

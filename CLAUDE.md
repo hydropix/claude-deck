@@ -111,7 +111,10 @@ these files:
 - `state/<session_id>.json` — one per session: `project`, `last_prompt`, `status`
   (`running`/`waiting`/`done`), `updated`, `ctx_tokens`. Overwritten each event; pruned after 24h.
 - `stats/events.jsonl` — append-only history (`{ ts, ev, id, project, ctx }` per line). This is
-  what makes trends/durations possible; trimmed to 90 days by the stats view.
+  what makes trends/durations possible; trimmed to 90 days by the stats view. When **cloud sync**
+  is on, each machine appends to its own `events-<HOST>.jsonl` in the sync folder instead (so two
+  PCs never collide on an append); the stats view reads every `events*.jsonl` and merges them
+  (`Get-CDEventLogs`). The local `events.jsonl` keeps being read as legacy/pre-sync history.
 - `objectives.json` — `{ items: { "<project>": [ { text, done }, ... ] } }`: the manually-typed
   per-project TODO list. The deck's group header shows it as a ONE-LINE scrollable todo (mouse
   wheel cycles tasks, a click toggles the shown task's done, the pencil opens the full add/edit/
@@ -123,12 +126,24 @@ these files:
   result: `current`/`latest`/`available`/`assetUrl`/`notes`), `update-result.json` (written by
   the updater's `-Bootstrap` worker after an install — `ok`/`version`/`error` — read once by the
   restarted tray to show a success/failure balloon, then deleted), `version.txt`,
-  `recap-shown.txt` (Monday-date tag of the last shown weekly recap, so it fires once/week).
+  `recap-shown.txt` (Monday-date tag of the last shown weekly recap, so it fires once/week),
+  `sync.txt` (the cloud-sync folder path, when configured — see below).
 - `.env` — user-editable settings (seeded once from `.env.example`, never overwritten): the
   weekly-recap LLM config — `LLM_PROVIDER` (`ollama`|`openai`), `LLM_URL`/`LLM_MODEL`/`LLM_API_KEY`
   for the OpenAI-compatible path, the legacy `OLLAMA_URL`/`OLLAMA_MODEL` for the native path
   (honoured as fallbacks), plus `LLM_ENABLED`/`LLM_TIMEOUT` and `RECAP_INCLUDE_OUTCOMES`/
   `RECAP_OUTCOME_CHARS`. Read via `Get-CDEnv`. Saved recaps land in `recaps/recap-<Monday>.md`.
+
+**Cloud sync (optional, opt-in).** Set a folder kept in sync across machines (Google Drive /
+OneDrive / Synology Drive) via the deck's gear menu ("Cloud sync folder…") — the path is stored
+in `sync.txt`. Only the **portable** user data follows you: `objectives.json` (one shared file)
+and the activity history (per-machine `events-<HOST>.jsonl`, conflict-free). Machine-local things
+(live `state/`, flags, opacity/size, version) never sync. The mechanism lives in `session-common.ps1`
+(`Get-CDSyncDir` / `Get-CDObjectivesPath` / `Get-CDEventWritePath` / `Get-CDEventLogs` / `Set-CDSyncDir`);
+the tracker mirrors the event-path logic inline (`Get-EventLogPath`) since it can't dot-source the lib.
+Every helper falls back to the local copy when the folder is unset or temporarily unreachable (drive
+not mounted yet), so nothing ever breaks. `objectives.json` is single-file last-write-wins (rare
+two-PC-at-once edits can lose one side); events are per-host so they never collide.
 
 ### Hooks wired by the installer
 

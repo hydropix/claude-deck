@@ -15,41 +15,50 @@ $ErrorActionPreference = 'SilentlyContinue'
 . (Join-Path $PSScriptRoot 'session-common.ps1')
 
 $statsDir = Get-CDPath 'stats'
-$logFile  = Join-Path $statsDir 'events.jsonl'
 
 # --- Data ------------------------------------------------------------------
 
-# Drop log entries older than 90 days (keeps the file small; we never chart that
-# far back). Single-reader context here, so a rewrite is safe. Best-effort.
+# Drop log entries older than 90 days (keeps files small; we never chart that far
+# back). We only rewrite the logs THIS machine owns - the local events.jsonl and
+# this host's events-<HOST>.jsonl in the sync folder - never another machine's
+# per-host file (rewriting it would race with its appends and trip the sync tool's
+# conflict detection). Best-effort.
 function Remove-OldEvents {
-  try {
-    if (-not (Test-Path $logFile)) { return }
-    $cutoff = (Get-Date).AddDays(-90)
-    $lines  = Get-Content -LiteralPath $logFile -ErrorAction Stop
-    $keep   = New-Object System.Collections.Generic.List[string]
-    $dropped = $false
-    foreach ($ln in $lines) {
-      if (-not $ln) { continue }
-      $ok = $true
-      try { $o = $ln | ConvertFrom-Json; if ([datetime]$o.ts -lt $cutoff) { $ok = $false } } catch { $ok = $true }
-      if ($ok) { $keep.Add($ln) } else { $dropped = $true }
-    }
-    if ($dropped) {
-      [System.IO.File]::WriteAllText($logFile, (($keep -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
-    }
-  } catch {}
+  $cutoff  = (Get-Date).AddDays(-90)
+  $targets = @((Join-Path $statsDir 'events.jsonl'), (Get-CDEventWritePath)) | Select-Object -Unique
+  foreach ($logFile in $targets) {
+    try {
+      if (-not (Test-Path -LiteralPath $logFile)) { continue }
+      $lines  = Get-Content -LiteralPath $logFile -ErrorAction Stop
+      $keep   = New-Object System.Collections.Generic.List[string]
+      $dropped = $false
+      foreach ($ln in $lines) {
+        if (-not $ln) { continue }
+        $ok = $true
+        try { $o = $ln | ConvertFrom-Json; if ([datetime]$o.ts -lt $cutoff) { $ok = $false } } catch { $ok = $true }
+        if ($ok) { $keep.Add($ln) } else { $dropped = $true }
+      }
+      if ($dropped) {
+        [System.IO.File]::WriteAllText($logFile, (($keep -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
+      }
+    } catch {}
+  }
 }
 
+# Merge every event log: the local legacy events.jsonl plus one events-<HOST>.jsonl
+# per machine from the sync folder (Get-CDEventLogs). Each machine's events are
+# disjoint (a session id is machine-local), so concatenating is correct - no dedup.
 function Read-Events {
   $events = New-Object System.Collections.Generic.List[object]
-  if (-not (Test-Path $logFile)) { return $events }
-  $lines = Get-Content -LiteralPath $logFile -ErrorAction SilentlyContinue
-  foreach ($ln in $lines) {
-    if (-not $ln) { continue }
-    try { $o = $ln | ConvertFrom-Json } catch { continue }
-    if (-not $o.ts) { continue }
-    try { $t = [datetime]$o.ts } catch { continue }
-    $events.Add([pscustomobject]@{ ts = $t; ev = [string]$o.ev; id = [string]$o.id; project = [string]$o.project; ctx = $o.ctx; sec = $o.sec })
+  foreach ($logFile in (Get-CDEventLogs)) {
+    $lines = Get-Content -LiteralPath $logFile -ErrorAction SilentlyContinue
+    foreach ($ln in $lines) {
+      if (-not $ln) { continue }
+      try { $o = $ln | ConvertFrom-Json } catch { continue }
+      if (-not $o.ts) { continue }
+      try { $t = [datetime]$o.ts } catch { continue }
+      $events.Add([pscustomobject]@{ ts = $t; ev = [string]$o.ev; id = [string]$o.id; project = [string]$o.project; ctx = $o.ctx; sec = $o.sec })
+    }
   }
   return $events
 }

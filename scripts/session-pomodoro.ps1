@@ -205,12 +205,13 @@ function Write-Pomo {
   } catch {}
 }
 
-# Gentle cue on a phase change (you may be heads-down with the deck closed).
+# Gentle cue on a phase change / focus nudge (you may be heads-down with the deck
+# closed). A short synthesized two-note rise, deliberately distinct from the
+# work-done chime (notify.wav played twice by the tracker). Played once.
 function Play-PomoChime {
   try {
-    $wav = Join-Path $PSScriptRoot 'notify.wav'
-    if (Test-Path $wav) { (New-Object System.Media.SoundPlayer($wav)).Play() }
-    else { [System.Media.SystemSounds]::Asterisk.Play() }
+    [console]::beep(587, 150)   # D5
+    [console]::beep(880, 220)   # A5 - the rise reads as "come back"
   } catch {}
 }
 

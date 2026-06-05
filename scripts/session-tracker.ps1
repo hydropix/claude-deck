@@ -42,9 +42,28 @@ function Save($obj) { [System.IO.File]::WriteAllText($file, ($obj | ConvertTo-Js
 # never fatal: a few short retries handle the rare cross-session write collision,
 # then we give up silently (a missing event must never break Claude Code).
 $statsDir = Join-Path $env:USERPROFILE '.claude\sessions\stats'
+# Resolve where to append events. If a cloud-sync folder is configured (sync.txt)
+# and reachable, write a PER-MACHINE log there (events-<HOST>.jsonl) so two PCs never
+# collide on an append; otherwise the local stats\events.jsonl. Fully self-contained
+# and best-effort - the tracker must never depend on session-common.ps1 (it runs
+# inside Claude Code hooks and must never throw). Mirrors Get-CDEventWritePath there.
+function Get-EventLogPath {
+  try {
+    $syncFile = Join-Path $env:USERPROFILE '.claude\sessions\sync.txt'
+    if (Test-Path $syncFile) {
+      $dir = ([System.IO.File]::ReadAllText($syncFile)).Trim()
+      if ($dir -and (Test-Path -LiteralPath $dir)) {
+        $hostTag = [string]$env:COMPUTERNAME
+        if (-not $hostTag) { $hostTag = 'pc' }
+        $hostTag = ($hostTag -replace '[^A-Za-z0-9_-]', '_')
+        return (Join-Path $dir ('events-{0}.jsonl' -f $hostTag))
+      }
+    }
+  } catch {}
+  return (Join-Path $statsDir 'events.jsonl')
+}
 function Add-Event($ev, $proj, $ctx) {
   try {
-    if (-not (Test-Path $statsDir)) { New-Item -ItemType Directory -Force -Path $statsDir | Out-Null }
     $line = ([ordered]@{
       ts      = (Get-Date).ToString('o')
       ev      = $ev
@@ -52,7 +71,9 @@ function Add-Event($ev, $proj, $ctx) {
       project = $proj
       ctx     = $ctx
     } | ConvertTo-Json -Compress)
-    $log = Join-Path $statsDir 'events.jsonl'
+    $log = Get-EventLogPath
+    $logDir = Split-Path -Parent $log
+    if ($logDir -and -not (Test-Path $logDir)) { New-Item -ItemType Directory -Force -Path $logDir | Out-Null }
     for ($i = 0; $i -lt 5; $i++) {
       try { [System.IO.File]::AppendAllText($log, $line + "`r`n", $utf8NoBom); break }
       catch { Start-Sleep -Milliseconds 40 }
@@ -100,9 +121,15 @@ function Set-Ctx($o, $ctx) {
 # Do-Not-Disturb; any failure stays silent. notify.wav sits next to this script
 # (deployed sessions dir, or scripts/ in the repo).
 function Play-Chime {
+  # $Repeat lets the work-done cue (stop) play twice back-to-back so it's
+  # distinct from the single-chime focus nudge and the needs-you (notify) cue.
+  param([int]$Repeat = 1)
   if (Test-Path (Join-Path $env:USERPROFILE '.claude\sessions\dnd.flag')) { return }
   $wav = Join-Path $PSScriptRoot 'notify.wav'
-  if (Test-Path $wav) { (New-Object System.Media.SoundPlayer $wav).PlaySync() }
+  if (Test-Path $wav) {
+    $player = New-Object System.Media.SoundPlayer $wav
+    for ($i = 0; $i -lt $Repeat; $i++) { $player.PlaySync() }   # PlaySync = sequential, so the two cues don't overlap
+  }
 }
 
 switch ($Event) {
@@ -160,7 +187,7 @@ switch ($Event) {
       })
       Add-Event 'stop' $proj $ctx.tokens
     }
-    Play-Chime   # session finished a turn
+    Play-Chime -Repeat 2   # session finished a turn -> double chime (vs. single for nudge/needs-you)
   }
   'notify' {
     # Claude needs the user (permission request, question, etc.).

@@ -174,7 +174,7 @@ if (Test-Path $projectsRoot) {
 # no done flag, so it contributes nothing (it isn't "completed").
 $completed = @{}
 try {
-  $objFile = Get-CDPath 'objectives.json'
+  $objFile = Get-CDObjectivesPath
   if (Test-Path $objFile) {
     $oj = [System.IO.File]::ReadAllText($objFile) | ConvertFrom-Json
     if ($oj -and $oj.items) {
@@ -186,30 +186,74 @@ try {
   }
 } catch {}
 
-# Build the ordered project list (most-active first). Cap how much we feed the LLM
-# so the synthesis stays short and the request stays small (a bit more headroom
-# when takeaways are included).
-$MAX_TURNS = 60
-$MAX_CHARS = if ($includeOutcomes) { 9000 } else { 6000 }
+# Build the ordered project list (most-active first), then assemble the text fed to
+# the LLM with WHOLE-WEEK COVERAGE as the priority. The old design kept only the
+# 60 newest turns and then only the last ~9000 chars of the block, so a very active
+# project's early-week work (e.g. a whole feature shipped Monday) never reached the
+# model - it summarized only the tail of the week. Now: every turn's REQUEST (the
+# "what was worked on") is always represented; the assistant takeaways are added
+# best-effort on the most RECENT turns with whatever budget is left; and if even the
+# requests overflow we sample evenly across the week (keeping the first and last) so
+# both ends survive instead of only the tail.
+$Q_CHARS   = 220   # per-request hard cap, so one long paste can't dominate the block
+$MAX_CHARS = if ($includeOutcomes) { 12000 } else { 8000 }
+
+function Truncate-Text([string]$s, [int]$n) {
+  if (-not $s) { return '' }
+  if ($s.Length -le $n) { return $s }
+  return $s.Substring(0, $n).TrimEnd() + [char]0x2026
+}
+
 $projList = @()
 foreach ($proj in ($byProject.Keys | Sort-Object { -$byProject[$_].Count })) {
-  $turns = @($byProject[$proj])
-  if ($turns.Count -gt $MAX_TURNS) { $turns = $turns[-$MAX_TURNS..-1] }
+  $allTurns = @($byProject[$proj])
+  $realCount = $allTurns.Count   # what the card/header reports (true week total)
+  $turns = $allTurns
+
+  # 1) Requests-only floor: every turn, chronological, each request capped.
+  $reqLen = 0
+  foreach ($t in $turns) { $reqLen += (Truncate-Text $t.q $Q_CHARS).Length + 3 }
+
+  # 2) If even the requests overflow, sample evenly across the week (always keeping
+  #    the first and last turn) rather than dropping the start.
+  if ($reqLen -gt $MAX_CHARS -and $turns.Count -gt 2) {
+    $keep = [math]::Max(2, [int][math]::Floor($turns.Count * $MAX_CHARS / $reqLen))
+    if ($keep -lt $turns.Count) {
+      $idx = New-Object System.Collections.ArrayList
+      for ($i = 0; $i -lt $keep; $i++) { [void]$idx.Add([int][math]::Round($i * ($turns.Count - 1) / ($keep - 1))) }
+      $idx = @($idx | Select-Object -Unique | Sort-Object)
+      $turns = @($idx | ForEach-Object { $allTurns[$_] })
+    }
+  }
+
+  # 3) Spend the leftover budget on takeaways, newest-first, then render in order.
+  $withA = @{}
+  if ($includeOutcomes) {
+    $used = 0
+    foreach ($t in $turns) { $used += (Truncate-Text $t.q $Q_CHARS).Length + 3 }
+    for ($i = $turns.Count - 1; $i -ge 0; $i--) {
+      $a = $turns[$i].a
+      if (-not $a) { continue }
+      $cost = $a.Length + 6
+      if ($used + $cost -gt $MAX_CHARS) { break }
+      $withA[$i] = $true; $used += $cost
+    }
+  }
   $lines = New-Object System.Collections.ArrayList
-  foreach ($t in $turns) {
-    [void]$lines.Add('- ' + $t.q)
-    if ($includeOutcomes -and $t.a) { [void]$lines.Add('  ' + [char]0x2192 + ' ' + $t.a) }   # -> takeaway
+  for ($i = 0; $i -lt $turns.Count; $i++) {
+    [void]$lines.Add('- ' + (Truncate-Text $turns[$i].q $Q_CHARS))
+    if ($withA.ContainsKey($i)) { [void]$lines.Add('  ' + [char]0x2192 + ' ' + $turns[$i].a) }   # -> takeaway
   }
   $block = ($lines -join "`n")
-  if ($block.Length -gt $MAX_CHARS) { $block = $block.Substring($block.Length - $MAX_CHARS) }
+
   $done = ''
   if ($completed.ContainsKey($proj)) { $done = $completed[$proj] }
   $projList += [pscustomobject]@{
     project   = $proj
     completed = $done
-    count     = $turns.Count
-    turns     = $turns
-    prompts   = @($turns | ForEach-Object { $_.q })
+    count     = $realCount
+    turns     = $allTurns
+    prompts   = @($allTurns | ForEach-Object { $_.q })
     block     = $block
   }
 }

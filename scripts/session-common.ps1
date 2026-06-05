@@ -36,6 +36,97 @@ function Write-CDText([string]$path, [string]$text) {
   [System.IO.File]::WriteAllText($path, $text, $script:CDUtf8)
 }
 
+# --- Cloud sync (optional) --------------------------------------------------
+# ClaudeDeck can mirror the PORTABLE user data - the per-project todo list
+# (objectives.json) and the activity history (events) - to a folder you keep in
+# sync across machines (Google Drive / OneDrive / Synology Drive, ...). Only these
+# two travel; live session state, flags, opacity/size and version stay machine-local.
+#
+# The target folder lives in sync.txt (a value file, like opacity.txt). When set
+# and reachable:
+#   * objectives.json  ->  <sync>\objectives.json          (one shared file)
+#   * activity events  ->  <sync>\events-<HOST>.jsonl       (ONE file per machine,
+#                          so two PCs never collide on an append; the stats view
+#                          reads every events*.jsonl and merges them)
+# If the folder is unset or temporarily missing (Drive not mounted yet), every
+# helper transparently falls back to the local ~/.claude/sessions copy - nothing
+# ever breaks. Events need no migration: the old local events.jsonl keeps being
+# read (Get-CDEventLogs merges it in) and only NEW events go to the per-host file.
+
+# The configured sync folder, or $null. Must exist on disk to count as reachable
+# (so an unmounted drive / offline NAS silently falls back to local).
+function Get-CDSyncDir {
+  try {
+    $f = Get-CDPath 'sync.txt'
+    if (Test-Path $f) {
+      $p = ([System.IO.File]::ReadAllText($f)).Trim()
+      if ($p -and (Test-Path -LiteralPath $p)) { return $p }
+    }
+  } catch {}
+  return $null
+}
+
+# A filesystem-safe machine tag for the per-host event log (COMPUTERNAME, sanitised).
+function Get-CDHostTag {
+  $h = [string]$env:COMPUTERNAME
+  if (-not $h) { $h = 'pc' }
+  return ($h -replace '[^A-Za-z0-9_-]', '_')
+}
+
+# Where objectives.json lives: the sync folder if configured & reachable, else local.
+function Get-CDObjectivesPath {
+  $s = Get-CDSyncDir
+  if ($s) { return (Join-Path $s 'objectives.json') }
+  return (Get-CDPath 'objectives.json')
+}
+
+# Where THIS machine APPENDS activity events: a per-host file in the sync folder if
+# configured, else the local single log. (Reading uses Get-CDEventLogs, which merges
+# every file - the local legacy log plus one per machine.)
+function Get-CDEventWritePath {
+  $s = Get-CDSyncDir
+  if ($s) { return (Join-Path $s ('events-{0}.jsonl' -f (Get-CDHostTag))) }
+  return (Get-CDPath 'stats\events.jsonl')
+}
+
+# Every event log to READ: the local stats\events.jsonl (pre-sync / legacy history)
+# plus every events*.jsonl in the sync folder (one per machine). De-duplicated by
+# full path so a file is never counted twice.
+function Get-CDEventLogs {
+  $paths = New-Object System.Collections.Generic.List[string]
+  $local = Get-CDPath 'stats\events.jsonl'
+  if (Test-Path $local) { [void]$paths.Add($local) }
+  $s = Get-CDSyncDir
+  if ($s) {
+    try {
+      foreach ($f in Get-ChildItem -LiteralPath $s -Filter 'events*.jsonl' -File -ErrorAction SilentlyContinue) {
+        if (-not $paths.Contains($f.FullName)) { [void]$paths.Add($f.FullName) }
+      }
+    } catch {}
+  }
+  return $paths
+}
+
+# Configure (or clear, when $path is empty) the cloud sync folder. On first set it
+# seeds <sync>\objectives.json from the existing local todo list when the sync folder
+# has none yet, so your current todos are never orphaned. Returns the trimmed path,
+# or $null when cleared.
+function Set-CDSyncDir([string]$path) {
+  $f = Get-CDPath 'sync.txt'
+  $p = ([string]$path).Trim()
+  if (-not $p) { try { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue } catch {}; return $null }
+  try { if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null } } catch {}
+  Write-CDText $f $p
+  try {
+    $dst = Join-Path $p 'objectives.json'
+    $src = Get-CDPath 'objectives.json'
+    if (-not (Test-Path -LiteralPath $dst) -and (Test-Path -LiteralPath $src)) {
+      Copy-Item -LiteralPath $src -Destination $dst -Force -ErrorAction SilentlyContinue
+    }
+  } catch {}
+  return $p
+}
+
 # --- Flag files (presence = on) --------------------------------------------
 # Toggle a flag file on/off. $path is the full flag path (callers already hold it).
 function Toggle-Flag([string]$path) {

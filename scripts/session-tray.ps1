@@ -146,6 +146,13 @@ function Build-Menu {
     Start-Process wscript.exe -ArgumentList ('"{0}"' -f $vbs) -ErrorAction SilentlyContinue
   })
 
+  $setup = $menu.Items.Add('Setup / configuration...')
+  $setup.ToolTipText = "Open the setup panel (recap LLM, cloud sync folder, updates, focus)"
+  $setup.Add_Click({
+    $vbs = Join-Path $env:USERPROFILE '.claude\sessions\show-onboarding.vbs'
+    Start-Process wscript.exe -ArgumentList ('"{0}"' -f $vbs) -ErrorAction SilentlyContinue
+  })
+
   [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
   $quit = $menu.Items.Add('Quit')
@@ -292,7 +299,8 @@ $focusTimer.Start()
 # the nudge's on/off switch (focus-off.flag). Reuses the Pomodoro classifier.
 # Best-effort; a logging failure is swallowed.
 # ============================================================================
-$eventsLog          = Get-CDPath 'stats\events.jsonl'
+# Event log path is resolved per-flush via Get-CDEventWritePath (it follows the
+# cloud-sync folder, which can be set after the tray started).
 $cdUtf8             = Get-CDUtf8
 $DISTRACT_SAMPLE_MS = 15000
 $DISTRACT_FLUSH_MS  = 300000   # flush an ongoing stint at least every 5 min (cap loss on crash)
@@ -306,10 +314,11 @@ function Flush-Distract {
       ts = (Get-Date).ToString('o'); ev = 'distract'; id = 'focus'
       project = 'distraction'; ctx = $null; sec = [int]$script:distractAcc
     } | ConvertTo-Json -Compress)
-    $dir = Split-Path -Parent $eventsLog
+    $log = Get-CDEventWritePath
+    $dir = Split-Path -Parent $log
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     for ($i = 0; $i -lt 5; $i++) {
-      try { [System.IO.File]::AppendAllText($eventsLog, $line + "`r`n", $cdUtf8); break }
+      try { [System.IO.File]::AppendAllText($log, $line + "`r`n", $cdUtf8); break }
       catch { Start-Sleep -Milliseconds 40 }
     }
   } catch {}
@@ -373,6 +382,17 @@ foreach ($try in @(
     @{ m = (1 -bor 8 -bor 0x4000); v = 0x4A },   # Win+Alt+J
     @{ m = (2 -bor 1 -bor 0x4000); v = 0x43 })) {  # Ctrl+Alt+C
   if ($hk.Register([uint32]$try.m, [uint32]$try.v)) { break }
+}
+
+# --- First-run setup panel -------------------------------------------------
+# On the very first tray launch (no onboarding-done.flag yet) open the setup
+# panel once, so a new user is walked through the recap LLM / cloud sync / update
+# / focus settings. The panel writes the flag whether the user saves OR skips, so
+# it never re-nags; it stays reachable from the tray menu and the deck's gear menu.
+$onbFlag = Join-Path $env:USERPROFILE '.claude\sessions\onboarding-done.flag'
+if (-not (Test-Path $onbFlag)) {
+  $onbVbs = Join-Path $env:USERPROFILE '.claude\sessions\show-onboarding.vbs'
+  if (Test-Path $onbVbs) { Start-Process wscript.exe -ArgumentList ('"{0}"' -f $onbVbs) -ErrorAction SilentlyContinue }
 }
 
 [System.Windows.Forms.Application]::Run()

@@ -95,7 +95,7 @@ Options live in the tray menu (state stored as small files under `~/.claude/sess
 | **Close on outside click** | **off** | When on, the overview also closes on a click anywhere outside it (0.5s grace to avoid accidental closes). `Esc` / **✕** always work. |
 | **Transparency** | Light (92 %) | Sets the overview window opacity: None / Light / Medium / Strong (100 / 92 / 80 / 65 %). Applied live. |
 | **Size** | Normal (55 %) | Sets the overview width: Compact / Normal / Wide / Extra wide (42 / 55 / 68 / 82 % of screen width). Applied live. |
-| **Automatic updates** | **off** | When on, ClaudeDeck checks the GitHub repo a couple of times a day for a newer version. See [Updates](#updates). |
+| **Automatic updates** | **off** | When on, ClaudeDeck checks the latest GitHub release about once an hour for a newer version. See [Updates](#updates). |
 
 **Position:** the overview header has three buttons next to **✕** — ▲ (top), ▬ (center), ▼ (bottom) — to dock the window to the top, middle, or bottom of the primary screen. The active one is highlighted; the choice is remembered.
 
@@ -106,13 +106,26 @@ Options live in the tray menu (state stored as small files under `~/.claude/sess
 ClaudeDeck can keep itself up to date from this GitHub repo — **opt-in, and off by default**.
 
 - Turn it on with the tray menu **Automatic updates** (or check on demand with **Check for updates**).
-- When enabled, the tray compares the installed version (`~/.claude/sessions/version.txt`) with [`scripts/version.txt`](scripts/version.txt) on the `main` branch a couple of times a day. The check runs in a hidden background process, so it never blocks the UI; if you're offline it simply does nothing.
-- If a newer version exists you get a tray balloon and an **Install update (vX)** entry at the top of the menu. Clicking it downloads the latest [`ClaudeDeck-Setup.cmd`](ClaudeDeck-Setup.cmd) and runs it — the same idempotent installer, so it refreshes the scripts, re-merges hooks, and restarts the tray.
+- When enabled, the tray compares the installed version (`~/.claude/sessions/version.txt`) with the tag of the **latest [GitHub release](https://github.com/hydropix/claude-deck/releases)**, about once an hour. Using published releases (not the `main` branch) means the updater only ever sees what was explicitly shipped. The check runs in a hidden background process, so it never blocks the UI; if you're offline it simply does nothing.
+- If a newer version exists you get a tray balloon and an **Install update (vX)** entry at the top of the menu. Clicking it downloads that release's `ClaudeDeck-Setup.cmd` asset and runs it — the same idempotent installer, so it refreshes the scripts, re-merges hooks, and restarts the tray (in a detached worker, so the update completes even though it restarts the app).
 - The current version is always shown at the bottom of the tray menu.
 
-> The updater lives in [`scripts/session-update.ps1`](scripts/session-update.ps1). Forking? Change the `$Owner` / `$Repo` / `$Branch` variables at the top so it points at your own repo.
+> The updater lives in [`scripts/session-update.ps1`](scripts/session-update.ps1). Forking? Change the `$Owner` / `$Repo` variables at the top so it reads your own repo's latest GitHub release.
 >
-> **Maintainers:** the version number comes from the latest **git tag** — that's the single source of truth. To publish a release: `git tag v1.1.0`, then run `tools/build-setup.ps1` (it writes `scripts/version.txt` from the tag and regenerates `ClaudeDeck-Setup.cmd`), then commit the regenerated `version.txt` + `.cmd` and push (`git push && git push --tags`). Installed clients with auto-update on pick it up on their next check.
+> **Maintainers:** the version number comes from the latest **git tag** — that's the single source of truth, and the updater reads **GitHub Releases**, so publishing the release is mandatory (a tag/push alone ships nothing to clients). To cut one:
+>
+> ```powershell
+> git tag v1.1.0
+> powershell -File .\tools\build-setup.ps1          # writes scripts/version.txt from the tag + regenerates ClaudeDeck-Setup.cmd
+> powershell -File .\tools\verify-bundle.ps1         # expect "--- ALL MATCH ---"
+> git add scripts/version.txt ClaudeDeck-Setup.cmd
+> git commit -m "Release v1.1.0: regenerate version.txt and installer from tag"
+> git tag -f v1.1.0                                  # move the tag onto the release commit
+> git push origin main && git push origin v1.1.0
+> gh release create v1.1.0 ClaudeDeck-Setup.cmd --title "ClaudeDeck v1.1.0" --notes "..."
+> ```
+>
+> A tracked **pre-commit hook** ([`tools/git-hooks/pre-commit`](tools/git-hooks/pre-commit)) regenerates and verifies `ClaudeDeck-Setup.cmd` on every `scripts/` change, so the single-file installer can never drift from the sources. Enable it once per clone with `powershell -File .\tools\install-hooks.ps1`.
 
 ## How it works
 

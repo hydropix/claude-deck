@@ -229,7 +229,7 @@ function Get-CDEnv {
     LLM_API_KEY            = ''
     LLM_ENABLED            = ''
     LLM_TIMEOUT            = ''
-    OLLAMA_URL             = 'http://ai_server.mds.com:11434'
+    OLLAMA_URL             = 'http://localhost:11434'
     OLLAMA_MODEL           = 'gemma4:latest'
     OLLAMA_ENABLED         = 'true'
     OLLAMA_TIMEOUT         = '60'

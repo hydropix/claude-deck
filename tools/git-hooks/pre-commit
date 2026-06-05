@@ -1,0 +1,51 @@
+#!/bin/sh
+# ClaudeDeck pre-commit hook — keeps the single-file installer in sync.
+#
+# ROOT-CAUSE FIX: ClaudeDeck-Setup.cmd is generated from scripts/ + install.ps1
+# by tools/build-setup.ps1, and the only safeguard (tools/verify-bundle.ps1) used
+# to be manual — so a commit could land edited scripts without the matching bundle
+# (exactly what happened to the v0.1.9 build). This hook makes that impossible:
+# whenever a commit touches scripts/ or install.ps1, it regenerates the bundle,
+# re-stages it, and verifies it byte-for-byte. A stale or mismatched bundle can no
+# longer be committed.
+#
+# Activated repo-wide via `git config core.hooksPath tools/git-hooks`
+# (run tools/install-hooks.ps1 once after cloning).
+#
+# NOTE: build-setup reads the WORKING TREE, not the staged index, so a partial
+# stage (git add -p) regenerates from working-tree content. For this project that
+# is the intended behaviour (the bundle must mirror the real scripts on disk).
+
+set -e
+
+# Only act when the installer's sources are part of this commit.
+if ! git diff --cached --name-only | grep -Eq '^(scripts/|install\.ps1$)'; then
+  exit 0
+fi
+
+# Locate a PowerShell interpreter (Windows PowerShell 5.1 or PowerShell 7).
+PS=""
+for c in powershell pwsh powershell.exe pwsh.exe; do
+  if command -v "$c" >/dev/null 2>&1; then PS="$c"; break; fi
+done
+if [ -z "$PS" ]; then
+  echo "[pre-commit] PowerShell not found — cannot regenerate ClaudeDeck-Setup.cmd" >&2
+  exit 1
+fi
+
+echo "[pre-commit] scripts/install changed -> regenerating ClaudeDeck-Setup.cmd"
+if ! "$PS" -NoProfile -ExecutionPolicy Bypass -File tools/build-setup.ps1 >/dev/null; then
+  echo "[pre-commit] build-setup.ps1 failed — commit aborted" >&2
+  exit 1
+fi
+
+# Backstop: confirm the regenerated bundle matches scripts/ byte-for-byte.
+if ! out=$("$PS" -NoProfile -ExecutionPolicy Bypass -File tools/verify-bundle.ps1 2>&1); then
+  echo "$out" >&2
+  echo "[pre-commit] bundle verification failed — commit aborted" >&2
+  exit 1
+fi
+
+# Stage the (re)generated artifacts so they ship with this very commit.
+git add ClaudeDeck-Setup.cmd scripts/version.txt
+exit 0

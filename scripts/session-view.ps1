@@ -4,7 +4,6 @@
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-try { [System.Windows.Forms.Application]::SetProcessDPIAware() | Out-Null } catch {}
 
 # Shared library + deck-specific partials (dot-sourced into this scope). Order
 # matters: load the WinForms/Drawing assemblies above first, then session-common
@@ -15,6 +14,10 @@ try { [System.Windows.Forms.Application]::SetProcessDPIAware() | Out-Null } catc
 . (Join-Path $PSScriptRoot 'session-ui-interop.ps1')
 . (Join-Path $PSScriptRoot 'session-ui-icons.ps1')
 . (Join-Path $PSScriptRoot 'session-ui-repo.ps1')
+
+# Declare Per-Monitor-V2 DPI awareness before any window is built (see common's
+# Set-CDDpiAware): keeps the overlay crisp on multi-monitor / mixed-scaling setups.
+Set-CDDpiAware
 
 $WindowTitle = 'Claude Code Sessions'
 
@@ -1250,7 +1253,18 @@ function Set-Collapsed([bool]$c) {
   }
   Update-CollapsePulse
 }
-$script:collapseBtn.Add_Click({ Set-Collapsed (-not $script:collapsed) })
+# The button is a Label, which fires TWO Click events for a double-click (Labels don't
+# coalesce into DoubleClick). Without this guard, double-clicking the button toggles
+# twice -> net nothing: collapsing via the button left the cursor on it, so a user's
+# "double-click to reopen" re-collapsed instantly. Swallow the second click within the
+# system double-click window so a double-click counts as a single toggle.
+$script:lastCollapseToggle = [Environment]::TickCount - 100000
+$script:collapseBtn.Add_Click({
+  $now = [Environment]::TickCount
+  if (($now - $script:lastCollapseToggle) -lt [System.Windows.Forms.SystemInformation]::DoubleClickTime) { return }
+  $script:lastCollapseToggle = $now
+  Set-Collapsed (-not $script:collapsed)
+})
 
 # Start/stop the collapsed-strip heartbeat to match the current state: pulse only
 # while collapsed with an active session. When it shouldn't run, restore the flat

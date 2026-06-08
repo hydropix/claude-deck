@@ -27,6 +27,10 @@ Add-Type -AssemblyName System.Drawing
 . (Join-Path $PSScriptRoot 'session-common.ps1')
 . (Join-Path $PSScriptRoot 'session-pomodoro.ps1')
 
+# Per-Monitor-V2 DPI awareness (common): keeps the tray's menus and dialogs crisp
+# on multi-monitor / mixed-scaling setups. Must run before any window is created.
+Set-CDDpiAware
+
 # --- Background auto-update (off by default) -------------------------------
 # When autoUpdFlag is present, the tray periodically asks session-update.ps1 to
 # compare the installed version with the GitHub repo and writes update.json. The

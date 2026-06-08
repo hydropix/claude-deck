@@ -206,7 +206,7 @@ if ($Print) {
 # --- Window ----------------------------------------------------------------
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-try { [System.Windows.Forms.Application]::SetProcessDPIAware() | Out-Null } catch {}
+Set-CDDpiAware   # Per-Monitor-V2 DPI awareness (common); crisp on mixed-scaling displays
 
 # Reuse the deck's exact project badge (New-Badge) so the workspace logo is
 # pixel-identical here and in the large view. Must load AFTER System.Drawing and

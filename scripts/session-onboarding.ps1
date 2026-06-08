@@ -17,9 +17,9 @@
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-try { [System.Windows.Forms.Application]::SetProcessDPIAware() | Out-Null } catch {}
 
 . (Join-Path $PSScriptRoot 'session-common.ps1')
+Set-CDDpiAware   # Per-Monitor-V2 DPI awareness (common); crisp on mixed-scaling displays
 
 # Single-instance: if a setup panel is already open, surface nothing fancy - just exit.
 $mutexCreated = $false

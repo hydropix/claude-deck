@@ -286,6 +286,7 @@ if ($Print) {
 # ============================================================================
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Set-CDDpiAware   # Per-Monitor-V2 DPI awareness (common); crisp on mixed-scaling displays
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
 # Palette (mirrors session-view.ps1).

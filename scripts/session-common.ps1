@@ -28,6 +28,35 @@
 function Get-CDRoot { Join-Path $env:USERPROFILE '.claude\sessions' }
 function Get-CDPath([string]$relative) { Join-Path (Get-CDRoot) $relative }
 
+# --- High-DPI awareness -----------------------------------------------------
+# WinForms looks fuzzy on multi-monitor / mixed-scaling setups unless the process
+# declares PER-MONITOR-V2 DPI awareness. The legacy SetProcessDPIAware() only pins
+# rendering to the PRIMARY monitor's DPI, so any window shown on a differently-
+# scaled monitor gets bitmap-stretched by Windows -> blurry text. Per-Monitor-V2
+# makes WinForms render at each monitor's native DPI; our fonts are point-based and
+# our window sizes derive from the active screen, so the layout follows correctly.
+# Call ONCE per process, before any window is created. Walks the API chain newest
+# -> oldest so it still does something on pre-1703 Windows. Never throws; the
+# PER-MONITOR-V2 path does not need System.Windows.Forms loaded yet.
+function Set-CDDpiAware {
+  try {
+    if (-not ('CDNative.Dpi' -as [type])) {
+      Add-Type -Namespace CDNative -Name Dpi -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool SetProcessDpiAwarenessContext(System.IntPtr value);
+[System.Runtime.InteropServices.DllImport("shcore.dll")]
+public static extern int SetProcessDpiAwareness(int value);
+'@ -ErrorAction Stop
+    }
+    # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4 (Windows 10 1703+).
+    if ([CDNative.Dpi]::SetProcessDpiAwarenessContext([System.IntPtr](-4))) { return }
+    # PROCESS_PER_MONITOR_DPI_AWARE = 2 (Windows 8.1+); HRESULT S_OK = 0.
+    if ([CDNative.Dpi]::SetProcessDpiAwareness(2) -eq 0) { return }
+  } catch {}
+  # Last resort: legacy system-DPI awareness (still better than unaware).
+  try { [System.Windows.Forms.Application]::SetProcessDPIAware() | Out-Null } catch {}
+}
+
 # --- UTF-8 without BOM ------------------------------------------------------
 # PS 5.1's Set-Content / Out-File mangle accents; always write through this.
 $script:CDUtf8 = New-Object System.Text.UTF8Encoding($false)

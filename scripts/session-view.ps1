@@ -163,7 +163,7 @@ function Set-Tasks([string]$project, $tasks) {
   elseif ($script:objectives.ContainsKey($project)) { $script:objectives.Remove($project) }
   $items = New-Object psobject
   foreach ($k in $script:objectives.Keys) {
-    $arr = @($script:objectives[$k] | ForEach-Object { [pscustomobject]@{ text = ([string]$_.text).Trim(); done = [bool]$_.done } })
+    $arr = @($script:objectives[$k] | ForEach-Object { [pscustomobject]@{ text = ([string]$_.text).Trim(); done = [bool]$_.done; desc = [string]$_.desc } })
     $items | Add-Member -NotePropertyName $k -NotePropertyValue $arr
   }
   try { Write-CDText (Get-CDObjectivesPath) ([pscustomobject]@{ items = $items } | ConvertTo-Json -Depth 6) } catch {}
@@ -225,6 +225,159 @@ function Read-Line([string]$title, [string]$initial) {
   return $null
 }
 
+# A larger, resizable task-detail dialog: a single-line title field on top and a
+# rich-text note below (RichTextBox with a Bold / Italic / Bullet toolbar, plus
+# Ctrl+B / Ctrl+I). Used by the task editor for Add / Edit. Returns a hashtable
+# @{ text; desc } on OK (desc is RTF, or '' when the note is blank) or $null on
+# Cancel. The note round-trips as RTF — pure ASCII, so it survives PS 5.1 encoding.
+# Suppresses the deck's click-outside-close while open (same guard as Read-Line).
+function Edit-TaskDetail([string]$title, [string]$initialText, [string]$initialDesc) {
+  $script:menuOpen = $true
+  $dlg = New-Object System.Windows.Forms.Form
+  $dlg.Text            = $title
+  $dlg.FormBorderStyle = 'Sizable'
+  $dlg.StartPosition   = 'CenterScreen'
+  $dlg.TopMost         = $true
+  $dlg.MaximizeBox     = $true
+  $dlg.MinimizeBox     = $false
+  $dlg.ShowInTaskbar   = $false
+  $dlg.BackColor       = $bg
+  $dlg.ForeColor       = $white
+  $dlg.Font            = New-Object System.Drawing.Font('Segoe UI', 9.75)
+  $dlg.ClientSize      = New-Object System.Drawing.Size(560, 460)
+  $dlg.MinimumSize     = New-Object System.Drawing.Size(420, 320)
+  try { if (Test-Path $iconPath) { $dlg.Icon = New-Object System.Drawing.Icon($iconPath) } } catch {}
+
+  $accent = Get-CDAccent
+
+  # Title field (single line) -----------------------------------------------
+  $lblT = New-Object System.Windows.Forms.Label
+  $lblT.Text = 'Title'; $lblT.AutoSize = $true; $lblT.ForeColor = $grey
+  $lblT.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+  $lblT.Location = New-Object System.Drawing.Point(16, 14)
+  $dlg.Controls.Add($lblT)
+
+  $txt = New-Object System.Windows.Forms.TextBox
+  $txt.Text        = [string]$initialText
+  $txt.BackColor   = $rowBg
+  $txt.ForeColor   = $white
+  $txt.BorderStyle = 'FixedSingle'
+  $txt.Font        = New-Object System.Drawing.Font('Segoe UI', 12)
+  $txt.Location    = New-Object System.Drawing.Point(16, 34)
+  $txt.Size        = New-Object System.Drawing.Size(528, 28)
+  $txt.Anchor      = 'Top,Left,Right'
+  $txt.MaxLength   = 200
+  $dlg.Controls.Add($txt)
+
+  # Description label + formatting toolbar ----------------------------------
+  $lblD = New-Object System.Windows.Forms.Label
+  $lblD.Text = 'Description'; $lblD.AutoSize = $true; $lblD.ForeColor = $grey
+  $lblD.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+  $lblD.Location = New-Object System.Drawing.Point(16, 76)
+  $dlg.Controls.Add($lblD)
+
+  # The note editor (built before the toolbar so the toolbar handlers capture it).
+  $rtb = New-Object System.Windows.Forms.RichTextBox
+  $rtb.BackColor   = $rowBg
+  $rtb.ForeColor   = $white
+  $rtb.BorderStyle = 'FixedSingle'
+  $rtb.Font        = New-Object System.Drawing.Font('Segoe UI', 11)
+  $rtb.Location    = New-Object System.Drawing.Point(16, 128)
+  $rtb.Size        = New-Object System.Drawing.Size(528, 280)
+  $rtb.Anchor      = 'Top,Bottom,Left,Right'
+  $rtb.AcceptsTab  = $false
+  $rtb.HideSelection = $false
+  $rtb.DetectUrls  = $false
+  # RTF round-trips faithfully; a blank/legacy desc is loaded as plain text.
+  if ($initialDesc -and $initialDesc.TrimStart().StartsWith('{\rtf')) {
+    try { $rtb.Rtf = $initialDesc } catch { $rtb.Text = '' }
+  } else {
+    $rtb.Text = [string]$initialDesc
+  }
+  $dlg.Controls.Add($rtb)
+
+  $lighten = { param($c, $d) [System.Drawing.Color]::FromArgb([math]::Min(255, $c.R + $d), [math]::Min(255, $c.G + $d), [math]::Min(255, $c.B + $d)) }
+  $mkTool = {
+    param([string]$text, [int]$left, [string]$tip, $font)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text
+    $b.Size = New-Object System.Drawing.Size(34, 28)
+    $b.Location = New-Object System.Drawing.Point($left, 98)
+    $b.FlatStyle = 'Flat'; $b.FlatAppearance.BorderSize = 0
+    $b.BackColor = $rowBg; $b.ForeColor = $white
+    $b.FlatAppearance.MouseOverBackColor = (& $lighten $rowBg 18)
+    $b.FlatAppearance.MouseDownBackColor = (& $lighten $rowBg 30)
+    $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $b.UseVisualStyleBackColor = $false
+    $b.TabStop = $false
+    if ($font) { $b.Font = $font }
+    $dlg.Controls.Add($b)
+    return $b
+  }
+
+  # Toggle a font-style bit (Bold/Italic) over the current selection. Mixed-font
+  # selections report a $null SelectionFont, so we fall back to the box font.
+  $toggleStyle = {
+    param([System.Drawing.FontStyle]$style)
+    $f = $rtb.SelectionFont; if (-not $f) { $f = $rtb.Font }
+    $ns = if ($f.Style -band $style) { $f.Style -bxor $style } else { $f.Style -bor $style }
+    $rtb.SelectionFont = New-Object System.Drawing.Font($f.FontFamily, $f.Size, $ns)
+    $rtb.Focus()
+  }.GetNewClosure()
+
+  $bBold = & $mkTool 'B' 16 'Bold (Ctrl+B)' (New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold))
+  $bBold.Add_Click({ & $toggleStyle ([System.Drawing.FontStyle]::Bold) }.GetNewClosure())
+  $bItal = & $mkTool 'I' 54 'Italic (Ctrl+I)' (New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Italic))
+  $bItal.Add_Click({ & $toggleStyle ([System.Drawing.FontStyle]::Italic) }.GetNewClosure())
+  $bBul = & $mkTool ([string][char]0x2022 + ' List') 92 'Bullet list' (New-Object System.Drawing.Font('Segoe UI', 9.75))
+  $bBul.Size = New-Object System.Drawing.Size(64, 28)
+  $bBul.Add_Click({ $rtb.SelectionBullet = -not $rtb.SelectionBullet; $rtb.Focus() }.GetNewClosure())
+
+  # Ctrl+B / Ctrl+I keyboard shortcuts inside the note.
+  $rtb.Add_KeyDown({
+    if ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::B) { & $toggleStyle ([System.Drawing.FontStyle]::Bold); $_.SuppressKeyPress = $true }
+    elseif ($_.Control -and $_.KeyCode -eq [System.Windows.Forms.Keys]::I) { & $toggleStyle ([System.Drawing.FontStyle]::Italic); $_.SuppressKeyPress = $true }
+  }.GetNewClosure())
+
+  # Save / Cancel (anchored bottom-right; Save carries the brand accent) -----
+  $ok = New-Object System.Windows.Forms.Button
+  $ok.Text = 'Save'; $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+  $ok.Size = New-Object System.Drawing.Size(110, 32)
+  $ok.Location = New-Object System.Drawing.Point(322, 418)
+  $ok.Anchor = 'Bottom,Right'
+  $ok.FlatStyle = 'Flat'; $ok.FlatAppearance.BorderSize = 0
+  $ok.BackColor = $accent; $ok.ForeColor = (Get-TextOn $accent)
+  $ok.FlatAppearance.MouseOverBackColor = (& $lighten $accent 18)
+  $ok.Cursor = [System.Windows.Forms.Cursors]::Hand
+  $ok.UseVisualStyleBackColor = $false
+  $dlg.Controls.Add($ok)
+
+  $cl = New-Object System.Windows.Forms.Button
+  $cl.Text = 'Cancel'; $cl.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+  $cl.Size = New-Object System.Drawing.Size(110, 32)
+  $cl.Location = New-Object System.Drawing.Point(436, 418)
+  $cl.Anchor = 'Bottom,Right'
+  $cl.FlatStyle = 'Flat'; $cl.FlatAppearance.BorderSize = 0
+  $cl.BackColor = $rowBg; $cl.ForeColor = $grey
+  $cl.FlatAppearance.MouseOverBackColor = (& $lighten $rowBg 18)
+  $cl.Cursor = [System.Windows.Forms.Cursors]::Hand
+  $cl.UseVisualStyleBackColor = $false
+  $dlg.Controls.Add($cl)
+
+  $dlg.CancelButton = $cl
+  $dlg.Add_Shown({ $txt.Focus(); $txt.SelectAll() }.GetNewClosure())
+
+  $res = $dlg.ShowDialog()
+  $outText = ([string]$txt.Text).Trim()
+  # Store '' when the note is blank, so callers can test `if ($t.desc)` cleanly.
+  $outDesc = if (([string]$rtb.Text).Trim()) { $rtb.Rtf } else { '' }
+  $dlg.Dispose()
+  $script:menuOpen = $false
+  $script:shownAt  = [Environment]::TickCount   # re-arm the click-outside grace
+  if ($res -eq [System.Windows.Forms.DialogResult]::OK) { return @{ text = $outText; desc = $outDesc } }
+  return $null
+}
+
 # Forces the next Refresh-List to rebuild (clears the anti-flicker signature). A
 # real function so it works from inside GetNewClosure'd handlers — a $script: write
 # in such a block lands in the closure's own module scope, not the script's.
@@ -261,6 +414,8 @@ function ET-RenderRow($rp) {
     $m.text.Font  = $script:etFontTask; $m.text.ForeColor = $white
   }
   $m.text.Text = [string]$t.text
+  # A faint notes glyph flags tasks that carry a rich-text description.
+  $m.note.Visible = [bool]([string]$t.desc).Trim()
 }
 function ET-Footer {
   $n = $script:etTasks.Count
@@ -296,19 +451,32 @@ function ET-MakeRow([int]$idx) {
   $chk.Location = New-Object System.Drawing.Point(13, 7)
   $rp.Controls.Add($chk)
 
+  $note = New-Object System.Windows.Forms.Label
+  $note.UseCompatibleTextRendering = $true
+  $note.Font = $script:etFontNote; $note.AutoSize = $true
+  $note.Text = Get-IconChar $script:MAT.notes 0x2630
+  $note.ForeColor = $script:etChkOff
+  $note.BackColor = [System.Drawing.Color]::Transparent
+  $note.Cursor = [System.Windows.Forms.Cursors]::Hand
+  $note.Location = New-Object System.Drawing.Point(($script:etRowW - 24), 9)
+  $note.Anchor = 'Top,Right'
+  $note.Visible = $false
+  $rp.Controls.Add($note)
+
   $txt = New-Object System.Windows.Forms.Label
   $txt.AutoSize = $false; $txt.TextAlign = 'MiddleLeft'; $txt.AutoEllipsis = $true
   $txt.BackColor = [System.Drawing.Color]::Transparent; $txt.Cursor = [System.Windows.Forms.Cursors]::Hand
   $txt.Location = New-Object System.Drawing.Point(42, 0)
-  $txt.Size = New-Object System.Drawing.Size(($script:etRowW - 42 - 10), 34)
+  $txt.Size = New-Object System.Drawing.Size(($script:etRowW - 42 - 28), 34)
   $rp.Controls.Add($txt)
 
-  $rp.Tag = @{ bar = $bar; check = $chk; text = $txt; idx = $idx }
+  $rp.Tag = @{ bar = $bar; check = $chk; text = $txt; note = $note; idx = $idx }
 
   $selectThis = { ET-Select $idx }.GetNewClosure()
   $rp.Add_Click($selectThis)
   $txt.Add_Click($selectThis)
   $txt.Add_DoubleClick({ ET-Edit }.GetNewClosure())
+  $note.Add_Click({ ET-Select $idx; ET-Edit }.GetNewClosure())
   $chk.Add_Click({ ET-Toggle $idx }.GetNewClosure())
   $rp.Add_MouseEnter({ if ($script:etSel -ne $idx) { $this.BackColor = $script:etRowHov } }.GetNewClosure())
   $rp.Add_MouseLeave({ if ($script:etSel -ne $idx) { $this.BackColor = $script:etRowIdle } }.GetNewClosure())
@@ -346,13 +514,16 @@ function ET-Fill([int]$select) {
 function ET-Edit {
   $i = $script:etSel
   if ($i -lt 0 -or $i -ge $script:etTasks.Count) { return }
-  $v = Read-Line ('Edit task ' + [char]0x2014 + ' ' + $script:etProject) ([string]$script:etTasks[$i].text)
-  if ($null -ne $v -and ([string]$v).Trim()) { $script:etTasks[$i].text = ([string]$v).Trim(); ET-Fill $i }
+  $t = $script:etTasks[$i]
+  $v = Edit-TaskDetail ('Edit task ' + [char]0x2014 + ' ' + $script:etProject) ([string]$t.text) ([string]$t.desc)
+  if ($null -ne $v -and ([string]$v.text).Trim()) {
+    $t.text = ([string]$v.text).Trim(); $t.desc = [string]$v.desc; ET-Fill $i
+  }
 }
 function ET-Add {
-  $v = Read-Line ('Add task ' + [char]0x2014 + ' ' + $script:etProject) ''
-  if ($null -ne $v -and ([string]$v).Trim()) {
-    [void]$script:etTasks.Add([pscustomobject]@{ text = ([string]$v).Trim(); done = $false })
+  $v = Edit-TaskDetail ('Add task ' + [char]0x2014 + ' ' + $script:etProject) '' ''
+  if ($null -ne $v -and ([string]$v.text).Trim()) {
+    [void]$script:etTasks.Add([pscustomobject]@{ text = ([string]$v.text).Trim(); done = $false; desc = [string]$v.desc })
     ET-Fill ($script:etTasks.Count - 1)
   }
 }
@@ -373,7 +544,7 @@ function ET-Move([int]$dir) {
 # Cancel. Suppresses the click-outside-close while open.
 function Edit-Tasks([string]$project) {
   $tasks = New-Object System.Collections.ArrayList
-  foreach ($t in (Get-Tasks $project)) { [void]$tasks.Add([pscustomobject]@{ text = [string]$t.text; done = [bool]$t.done }) }
+  foreach ($t in (Get-Tasks $project)) { [void]$tasks.Add([pscustomobject]@{ text = [string]$t.text; done = [bool]$t.done; desc = [string]$t.desc }) }
 
   $script:menuOpen = $true
   $dlg = New-Object System.Windows.Forms.Form
@@ -405,6 +576,7 @@ function Edit-Tasks([string]$project) {
   $script:etFontTask = New-Object System.Drawing.Font('Segoe UI', 11)
   $script:etFontDone = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Strikeout)
   $script:etFontChk  = New-IconFont ([single]13)
+  $script:etFontNote = New-IconFont ([single]11)
 
   # Project-coloured dot + name, with a usage hint on the right.
   $dot = New-Object System.Windows.Forms.Label
@@ -519,7 +691,7 @@ function Edit-Tasks([string]$project) {
   $script:menuOpen = $false
   $script:shownAt  = [Environment]::TickCount   # re-arm the click-outside grace
   if ($res -eq [System.Windows.Forms.DialogResult]::OK) {
-    return @($script:etTasks | ForEach-Object { [pscustomobject]@{ text = [string]$_.text; done = [bool]$_.done } })
+    return @($script:etTasks | ForEach-Object { [pscustomobject]@{ text = [string]$_.text; done = [bool]$_.done; desc = [string]$_.desc } })
   }
   return $null
 }

@@ -206,12 +206,19 @@ function Write-Pomo {
 }
 
 # Gentle cue on a phase change / focus nudge (you may be heads-down with the deck
-# closed). A short synthesized two-note rise, deliberately distinct from the
-# work-done chime (notify.wav played twice by the tracker). Played once.
+# closed). Plays the same soft notify.wav rise the tracker uses, but ONCE - so it
+# stays distinct from the work-done chime (which the tracker plays twice). The raw
+# [console]::beep square waves it used to emit sound harsh on most hardware, so
+# they're now only a fallback for when the chime asset is missing.
 function Play-PomoChime {
   try {
-    [console]::beep(587, 150)   # D5
-    [console]::beep(880, 220)   # A5 - the rise reads as "come back"
+    $wav = Join-Path $PSScriptRoot 'notify.wav'
+    if (Test-Path $wav) {
+      (New-Object System.Media.SoundPlayer $wav).PlaySync()
+    } else {
+      [console]::beep(587, 150)   # D5 - fallback only
+      [console]::beep(880, 220)   # A5
+    }
   } catch {}
 }
 

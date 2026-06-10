@@ -115,11 +115,15 @@ these files:
   is on, each machine appends to its own `events-<HOST>.jsonl` in the sync folder instead (so two
   PCs never collide on an append); the stats view reads every `events*.jsonl` and merges them
   (`Get-CDEventLogs`). The local `events.jsonl` keeps being read as legacy/pre-sync history.
-- `objectives.json` — `{ items: { "<project>": [ { text, done }, ... ] } }`: the manually-typed
-  per-project TODO list. The deck's group header shows it as a ONE-LINE scrollable todo (mouse
+- `objectives.json` — `{ items: { "<project>": [ { text, done, desc }, ... ] } }`: the manually-
+  typed per-project TODO list. Each task has a `text` (title), a `done` flag, and an optional
+  `desc` — a rich-text note stored as **RTF** (empty string when none; pure-ASCII so it survives
+  PS 5.1 encoding). The deck's group header shows the list as a ONE-LINE scrollable todo (mouse
   wheel cycles tasks, a click toggles the shown task's done, the pencil opens the full add/edit/
-  delete/reorder editor); the weekly recap reads only the ticked-done tasks as "completed". A legacy
-  single `"<text>"` string is still read as one undone task — see `ConvertTo-CDTasks` /
+  delete/reorder editor — the per-task Add/Edit dialog (`Edit-TaskDetail` in `session-view.ps1`)
+  is a resizable window with the title plus a `RichTextBox` note + Bold/Italic/Bullet toolbar);
+  the weekly recap reads only the ticked-done tasks' `text` as "completed". A legacy single
+  `"<text>"` string is still read as one undone task — see `ConvertTo-CDTasks` /
   `Format-CDObjective` in `session-common.ps1`, the shared normaliser both surfaces use.
 - Flag files (presence = on): `dnd.flag`, `closeoutside.flag`, `autoupdate.flag`.
 - Value files: `opacity.txt` (20–100), `size.txt` (scale), `update.json` (the last `-Check`

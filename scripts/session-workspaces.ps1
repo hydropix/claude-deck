@@ -14,10 +14,11 @@
 #   - run directly for manual use / testing:
 #       powershell -File .\scripts\session-workspaces.ps1 -Save
 #       powershell -File .\scripts\session-workspaces.ps1 -Restore
+#       powershell -File .\scripts\session-workspaces.ps1 -Restore -Only "C:\path\to\one"
 #       powershell -File .\scripts\session-workspaces.ps1 -List   # print, no side effects
 #   - dot-sourced by session-tray.ps1, which then calls the functions in-process
 #     (a dot-source defines the functions only; the action block below is skipped).
-param([switch]$Save, [switch]$Restore, [switch]$List)
+param([switch]$Save, [switch]$Restore, [switch]$List, [string]$Only)
 
 # NOTE: do NOT set $ErrorActionPreference here at script scope - when this file is
 # dot-sourced (by the tray / view), that would leak into the caller and silently
@@ -164,12 +165,15 @@ function Resolve-IdeExe([string]$app) {
 # Reopen every saved workspace. Code.exe "<path>" opens a folder window; given a
 # .code-workspace file it opens that as a workspace. If the window is already
 # open the IDE just focuses it, so this is safe to click repeatedly.
-function Restore-Workspaces {
+# With $only set, restores just the saved item whose path matches (one click =
+# one workspace - used by the deck's per-workspace submenu).
+function Restore-Workspaces([string]$only) {
   $items = Read-SavedWorkspaces
   $opened = 0
   foreach ($it in $items) {
     $path = [string]$it.path
     if (-not $path) { continue }
+    if ($only -and -not $path.Equals($only, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
     if (-not (Test-Path $path)) { continue }   # workspace deleted/moved since the snapshot
     $exe = Resolve-IdeExe ([string]$it.app)
     if (-not $exe) { continue }
@@ -187,7 +191,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     $n = Save-Workspaces
     Write-Host ("Saved {0} workspace(s) -> {1}" -f $n, $wsFile)
   } elseif ($Restore) {
-    $n = Restore-Workspaces
+    $n = Restore-Workspaces $Only
     Write-Host ("Reopened {0} workspace(s)." -f $n)
   } else {
     # -List (default): print what is currently open and what is saved.

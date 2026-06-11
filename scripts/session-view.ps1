@@ -79,17 +79,18 @@ $nudgeFile   = Join-Path $env:USERPROFILE '.claude\sessions\focus-nudge.txt'
 # session list rendering. This mirrors Invoke-Updater above and keeps scopes clean.
 $wsHelper = Join-Path $PSScriptRoot 'session-workspaces.ps1'
 $wsFile   = Join-Path $env:USERPROFILE '.claude\sessions\workspaces.json'
-function Invoke-Workspaces([string]$mode) {
+function Invoke-Workspaces([string]$mode, [string]$only) {
   if (-not (Test-Path $wsHelper)) { return }
-  Start-Process powershell -WindowStyle Hidden -ArgumentList @(
-    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $wsHelper), $mode
-  ) -ErrorAction SilentlyContinue
+  $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $wsHelper), $mode)
+  if ($only) { $argv += @('-Only', ('"{0}"' -f $only)) }
+  Start-Process powershell -WindowStyle Hidden -ArgumentList $argv -ErrorAction SilentlyContinue
 }
-# Count of saved favorites - read straight from workspaces.json (no helper needed).
-function Get-FavCount {
-  try { if (Test-Path $wsFile) { return @(([System.IO.File]::ReadAllText($wsFile) | ConvertFrom-Json).items).Count } } catch {}
-  return 0
+# Saved favorites - read straight from workspaces.json (no helper needed).
+function Get-FavItems {
+  try { if (Test-Path $wsFile) { return @(([System.IO.File]::ReadAllText($wsFile) | ConvertFrom-Json).items) } } catch {}
+  return @()
 }
+function Get-FavCount { return @(Get-FavItems).Count }
 
 # --- Per-project objectives (a scrollable one-line todo list) ---------------
 # Each project carries a manually-typed TODO list, shared by ALL of that project's
@@ -1190,9 +1191,11 @@ function Build-SettingsMenu {
 
   # Favorite workspaces - a fully manual pair. "Save" snapshots the VS Code /
   # Cursor windows open right now into workspaces.json; "Reopen" relaunches them
-  # all in one click (survives a Windows restart). Closing/opening windows in
-  # between changes nothing until you click Save again.
-  $wsN = Get-FavCount
+  # (survives a Windows restart). Closing/opening windows in between changes
+  # nothing until you click Save again. "Reopen" is a submenu: "Reopen all" plus
+  # one entry per saved workspace, so favorites can also be reopened one by one.
+  $wsItems = Get-FavItems
+  $wsN = @($wsItems).Count
 
   $wsSave = New-Object System.Windows.Forms.ToolStripMenuItem('Save open workspaces as favorites')
   $wsSave.ToolTipText = "Remember the VS Code / Cursor windows open right now (overwrites the previous set)"
@@ -1203,7 +1206,22 @@ function Build-SettingsMenu {
   $wsRe = New-Object System.Windows.Forms.ToolStripMenuItem($wsReTxt)
   $wsRe.ToolTipText = "Relaunch the workspaces saved as favorites"
   $wsRe.Enabled = ($wsN -gt 0)
-  $wsRe.Add_Click({ Invoke-Workspaces '-Restore' })
+  if ($wsN -gt 0) {
+    $wsAll = New-Object System.Windows.Forms.ToolStripMenuItem(("Reopen all ({0})" -f $wsN))
+    $wsAll.ToolTipText = "Relaunch every saved workspace in one click"
+    $wsAll.Add_Click({ Invoke-Workspaces '-Restore' })
+    [void]$wsRe.DropDownItems.Add($wsAll)
+    [void]$wsRe.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+    foreach ($it in $wsItems) {
+      $p = [string]$it.path
+      if (-not $p) { continue }
+      $name = [string]$it.name; if (-not $name) { $name = $p }
+      $mi = New-Object System.Windows.Forms.ToolStripMenuItem($name)
+      $mi.ToolTipText = ('{0}  [{1}]' -f $p, [string]$it.app)
+      $mi.Add_Click({ Invoke-Workspaces '-Restore' $p }.GetNewClosure())
+      [void]$wsRe.DropDownItems.Add($mi)
+    }
+  }
   [void]$m.Items.Add($wsRe)
 
   [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))

@@ -130,6 +130,10 @@ these files:
   result: `current`/`latest`/`available`/`assetUrl`/`notes`), `update-result.json` (written by
   the updater's `-Bootstrap` worker after an install — `ok`/`version`/`error` — read once by the
   restarted tray to show a success/failure balloon, then deleted), `version.txt`,
+  `update-attempted.txt` (the last version the tray tried to auto-install — with
+  `autoupdate.flag` on, a found update is installed without a click; this marker caps each
+  version at one automatic attempt so a failing release degrades to the manual "Install
+  update" entry instead of an install/restart loop),
   `recap-shown.txt` (Monday-date tag of the last shown weekly recap, so it fires once/week),
   `sync.txt` (the cloud-sync folder path, when configured — see below).
 - `.env` — user-editable settings (seeded once from `.env.example`, never overwritten): the

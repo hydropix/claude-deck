@@ -33,11 +33,15 @@ Set-CDDpiAware
 
 # --- Background auto-update (off by default) -------------------------------
 # When autoUpdFlag is present, the tray periodically asks session-update.ps1 to
-# compare the installed version with the GitHub repo and writes update.json. The
-# desk's gear menu reads that file and offers the install. The toggle itself also
-# lives in the desk - the tray only runs the check.
-$autoUpdFlag = Join-Path $env:USERPROFILE '.claude\sessions\autoupdate.flag'
-$updInfoFile = Join-Path $env:USERPROFILE '.claude\sessions\update.json'
+# compare the installed version with the GitHub repo (writing update.json) and
+# INSTALLS a found update by itself - no click needed; the deck restarts on its
+# own. update-attempted.txt remembers the last auto-attempted version so a failed
+# install is never retried in a loop: that version falls back to the manual
+# "Install update" entry (tray + desk gear menu), which always stays available.
+# The toggle itself lives in the desk.
+$autoUpdFlag   = Join-Path $env:USERPROFILE '.claude\sessions\autoupdate.flag'
+$updInfoFile   = Join-Path $env:USERPROFILE '.claude\sessions\update.json'
+$autoApplyMark = Join-Path $env:USERPROFILE '.claude\sessions\update-attempted.txt'
 
 # Invoke-Updater (launch the check/apply) and Get-UpdateInfo (read update.json) live
 # in session-common.ps1, shared with the deck.
@@ -45,15 +49,45 @@ $updInfoFile = Join-Path $env:USERPROFILE '.claude\sessions\update.json'
 # Check only when enabled, and at most once an hour. The throttle window (55 min)
 # sits just under the hourly timer so every tick actually re-checks - a freshly
 # published release is then noticed within ~1h instead of being suppressed for 12h.
+# Returns $true when a check was actually launched, so the timer can schedule a
+# quick follow-up tick to pick up its (asynchronous) result instead of waiting 1h.
 function Invoke-UpdateCheckThrottled {
-  if (-not (Test-Path $autoUpdFlag)) { return }
+  if (-not (Test-Path $autoUpdFlag)) { return $false }
   try {
     if (Test-Path $updInfoFile) {
       $j = [System.IO.File]::ReadAllText($updInfoFile) | ConvertFrom-Json
-      if ($j.checked -and ((Get-Date) - [datetime]$j.checked).TotalMinutes -lt 55) { return }
+      if ($j.checked -and ((Get-Date) - [datetime]$j.checked).TotalMinutes -lt 55) { return $false }
     }
   } catch {}
   Invoke-Updater '-Check'
+  return $true
+}
+
+# Auto-install: when the auto-update flag is on and update.json reports a newer
+# version we haven't tried yet, launch -Apply without user interaction (the
+# bootstrap worker stops the deck, installs, and restarts the tray). Each version
+# is attempted at most ONCE (update-attempted.txt): if the install fails, the
+# user keeps the manual "Install update" entry instead of an endless retry loop.
+# Returns $true when an install was launched (the caller then skips the
+# "update available" balloon - the install balloon replaces it).
+function Invoke-AutoApply {
+  if (-not (Test-Path $autoUpdFlag)) { return $false }
+  $u = Get-UpdateInfo
+  if (-not $u) { return $false }
+  $ver = [string]$u.latest
+  if (-not $ver) { return $false }
+  try {
+    if ((Test-Path $autoApplyMark) -and ((([System.IO.File]::ReadAllText($autoApplyMark)).Trim()) -eq $ver)) { return $false }
+  } catch {}
+  try { Write-CDText $autoApplyMark $ver } catch {}
+  try {
+    $notify.BalloonTipTitle = 'ClaudeDeck update'
+    $notify.BalloonTipText  = ('Installing v{0} automatically - the deck will restart in a moment.' -f $ver)
+    $notify.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Info
+    $notify.ShowBalloonTip(6000)
+  } catch {}
+  Invoke-Updater '-Apply'
+  return $true
 }
 
 # Pop a one-shot tray balloon the first time we see a given available version this
@@ -164,15 +198,16 @@ function Build-Menu {
   $quit.Add_Click({ $notify.Visible = $false; [System.Windows.Forms.Application]::Exit() })
 }
 
-# Background update check: an initial check shortly after start, then hourly
-# (throttled to ~12h inside Invoke-UpdateCheckThrottled).
+# Background update check: an initial check shortly after start, then hourly.
+# When a check is launched (async child process), the next tick comes after 90s
+# instead of 1h so a freshly found update is auto-installed right away.
 $updTimer = New-Object System.Windows.Forms.Timer
 $updTimer.Interval = 8000   # first tick ~8s after launch, then switches to hourly
 $updTimer.Add_Tick({
   $updTimer.Interval = 3600000
-  Show-UpdateResult            # if we were just restarted by an install, report its outcome (once)
-  Show-UpdateNotice            # surface any already-known update (balloon, once per version/session)
-  Invoke-UpdateCheckThrottled  # then maybe launch a fresh check; its result shows next tick / on menu open
+  Show-UpdateResult                                  # if we were just restarted by an install, report its outcome (once)
+  if (-not (Invoke-AutoApply)) { Show-UpdateNotice } # auto-install a known update, or just surface it (balloon)
+  if (Invoke-UpdateCheckThrottled) { $updTimer.Interval = 90000 }  # quick follow-up tick to consume the fresh result
 })
 $updTimer.Start()
 

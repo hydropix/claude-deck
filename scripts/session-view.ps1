@@ -1229,7 +1229,7 @@ function Build-SettingsMenu {
   # Auto-update toggle (opt-in / off by default) + manual check.
   $au = New-Object System.Windows.Forms.ToolStripMenuItem('Automatic updates')
   $au.Checked = (Test-Path $autoUpdFlag)
-  $au.ToolTipText = "Periodically checks the GitHub repo and offers to install new versions"
+  $au.ToolTipText = "Periodically checks GitHub and installs new versions automatically (the deck restarts on its own)"
   $au.Add_Click({
     if (Test-Path $autoUpdFlag) { Remove-Item $autoUpdFlag -Force -ErrorAction SilentlyContinue }
     else { Set-Content -LiteralPath $autoUpdFlag -Value '' -Encoding ASCII; Invoke-Updater '-Check' }

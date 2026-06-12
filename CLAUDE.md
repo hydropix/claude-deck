@@ -3,6 +3,22 @@
 Guidance for working on ClaudeDeck — a minimalist Windows tray dashboard for Claude Code
 sessions, written in PowerShell (no Node/Python). Shell is PowerShell on Windows.
 
+## Running commands (agent gotchas)
+
+The Bash tool here is a POSIX bash on Windows — every `powershell -File` example in this
+file uses `.\` paths that bash strips before powershell.exe sees them (`.\tools\build.ps1`
+becomes `.toolsbuild.ps1` → "file does not exist"). Two rules:
+
+- **Use forward slashes** in any command run through bash: `powershell -File ./tools/build-setup.ps1`.
+- **Never mix PowerShell cmdlets into a bash pipeline** (`... | Select-Object` fails with
+  "command not found"); either keep the pipeline pure POSIX (`head`, `grep`) or wrap the
+  whole thing in `powershell -Command "..."`.
+- **Avoid inline `powershell -Command` for anything non-trivial.** Bash expands `$_` inside
+  double quotes (it became `extglob.CommandLine` once), and escaping WQL filters like
+  `"Name='powershell.exe'"` through two quoting layers is a lost cause. For anything with
+  `$_`, pipelines or nested quotes, write a helper `.ps1` and run it with `-File`
+  (e.g. `tools/kill-app.ps1` stops the running tray/view/stats before a redeploy).
+
 ## How it works (architecture)
 
 ClaudeDeck has no server and no daemon doing the tracking — it piggybacks on **Claude Code

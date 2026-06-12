@@ -1897,6 +1897,7 @@ Update-PosHighlight
 # the vertical (overridden the moment you click the top/bottom buttons). The
 # refresh timer skips repositioning while a drag is in progress (see Refresh-List).
 $script:dragging   = $false
+$script:dragMoved  = $false   # true once the cursor travelled past the click threshold
 $script:dragOrigin = $null    # cursor screen position when the drag began
 $script:dragStart  = $null    # window location when the drag began
 $header.Cursor = [System.Windows.Forms.Cursors]::SizeAll
@@ -1936,12 +1937,22 @@ function Save-CustomPosition {
 }
 function Start-Drag {
   $script:dragging   = $true
+  $script:dragMoved  = $false
   $script:dragOrigin = [System.Windows.Forms.Cursor]::Position
   $script:dragStart  = $form.Location
 }
 function Do-Drag {
   if (-not $script:dragging) { return }
   $cur = [System.Windows.Forms.Cursor]::Position
+  # Arm the drag only past a small real travel. Windows posts synthetic
+  # WM_MOUSEMOVEs with NO motion (notably right after a menu closes), and a
+  # sub-pixel wiggle during a plain click must not pop the ghost: a TopMost
+  # window appearing under the cursor mid-click makes WinForms swallow the
+  # control's Click/DoubleClick (the WindowFromPoint gate in WmMouseUp).
+  if (-not $script:dragMoved) {
+    if (([math]::Abs($cur.X - $script:dragOrigin.X) -lt 4) -and ([math]::Abs($cur.Y - $script:dragOrigin.Y) -lt 4)) { return }
+    $script:dragMoved = $true
+  }
   $nx  = $script:dragStart.X + ($cur.X - $script:dragOrigin.X)
   if ($script:collapsed) {
     # Collapsed, the strip can't float vertically: it stays glued to an edge and only
@@ -1981,19 +1992,27 @@ function End-Drag {
   }
   Save-CustomPosition
 }
-foreach ($dragSurface in @($header, $title)) {
-  $dragSurface.Add_MouseDown({ param($snd, $e) if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) { Start-Drag } })
-  $dragSurface.Add_MouseMove({ param($snd, $e) Do-Drag })
-  $dragSurface.Add_MouseUp({   param($snd, $e) End-Drag })
-  # Double-click on empty header space (or the title) folds/unfolds the deck — same
-  # toggle as the ▲/▼ button. Cancel the in-flight drag the down/up pair started so a
-  # double-click never registers as a 1px move (which would flip the deck to 'free').
-  $dragSurface.Add_MouseDoubleClick({ param($snd, $e)
-    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
+# The passive Pomodoro labels (clock + status) join the drag/double-click surfaces:
+# while a timer runs they occupy most of the collapsed strip, and without handlers a
+# double-click landing on them silently did nothing — "double-click to expand" only
+# worked on the title or the gaps. (The pomo ICON buttons keep their own Click actions.)
+foreach ($dragSurface in @($header, $title, $script:pomoTime, $script:pomoStatus)) {
+  # Double-click on the header/title folds/unfolds the deck — same toggle as the
+  # ▲/▼ button. Detected on the SECOND MouseDown (e.Clicks = 2), NOT via the
+  # MouseDoubleClick event: WinForms only raises Click/DoubleClick when the window
+  # under the cursor at mouse-UP is the control itself (WindowFromPoint gate), so
+  # anything sliding under the cursor mid-click — the drag ghost, fallout from a
+  # just-closed menu — silently ate the event ("double-click doesn't always work").
+  # e.Clicks on MouseDown is the raw Win32 WM_LBUTTONDBLCLK and always arrives.
+  $dragSurface.Add_MouseDown({ param($snd, $e)
+    if ($e.Button -ne [System.Windows.Forms.MouseButtons]::Left) { return }
+    if ($e.Clicks -ge 2) {
       $script:dragging = $false; Hide-Ghost
       Set-Collapsed (-not $script:collapsed)
-    }
+    } else { Start-Drag }
   })
+  $dragSurface.Add_MouseMove({ param($snd, $e) Do-Drag })
+  $dragSurface.Add_MouseUp({   param($snd, $e) End-Drag })
 }
 
 $hint = New-Object System.Windows.Forms.Label

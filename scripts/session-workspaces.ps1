@@ -16,9 +16,10 @@
 #       powershell -File .\scripts\session-workspaces.ps1 -Restore
 #       powershell -File .\scripts\session-workspaces.ps1 -Restore -Only "C:\path\to\one"
 #       powershell -File .\scripts\session-workspaces.ps1 -List   # print, no side effects
+#       powershell -File .\scripts\session-workspaces.ps1 -OpenJson  # currently-open windows as JSON
 #   - dot-sourced by session-tray.ps1, which then calls the functions in-process
 #     (a dot-source defines the functions only; the action block below is skipped).
-param([switch]$Save, [switch]$Restore, [switch]$List, [string]$Only)
+param([switch]$Save, [switch]$Restore, [switch]$List, [switch]$OpenJson, [string]$Only)
 
 # NOTE: do NOT set $ErrorActionPreference here at script scope - when this file is
 # dot-sourced (by the tray / view), that would leak into the caller and silently
@@ -193,6 +194,10 @@ if ($MyInvocation.InvocationName -ne '.') {
   } elseif ($Restore) {
     $n = Restore-Workspaces $Only
     Write-Host ("Reopened {0} workspace(s)." -f $n)
+  } elseif ($OpenJson) {
+    # Machine-readable dump of the currently-open windows, for the deck's "add
+    # from open windows" picker (it captures this stdout). Always emit an array.
+    [Console]::Out.Write((@(Get-OpenWorkspaces) | ConvertTo-Json -Depth 5))
   } else {
     # -List (default): print what is currently open and what is saved.
     Write-Host '--- Currently open ---'

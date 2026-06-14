@@ -92,6 +92,70 @@ function Get-FavItems {
 }
 function Get-FavCount { return @(Get-FavItems).Count }
 
+# Persist a curated favorites list back to workspaces.json (UTF-8 no BOM, same
+# { saved, items } shape the helper reads). The deck now OWNS this file as a
+# manually-managed list: the manager (Edit-Workspaces) and the row right-click
+# add/remove single entries here; the old whole-set snapshot is gone.
+function Save-FavItems($items) {
+  try {
+    $arr = @($items | ForEach-Object { [pscustomobject]@{
+      app = [string]$_.app; kind = [string]$_.kind; path = [string]$_.path; name = [string]$_.name } })
+    $obj = [pscustomobject]@{ saved = (Get-Date).ToString('o'); items = @($arr) }
+    Write-CDText $wsFile ($obj | ConvertTo-Json -Depth 5)
+  } catch {}
+}
+# True when $path (any app) is already a favorite.
+function Test-IsFav([string]$path) {
+  if (-not $path) { return $false }
+  $p = $path.ToLowerInvariant()
+  foreach ($it in (Get-FavItems)) { if (([string]$it.path).ToLowerInvariant() -eq $p) { return $true } }
+  return $false
+}
+# Append one workspace, de-duplicated by app+path. Returns $true when added,
+# $false when it was already there (or the path was empty).
+function Add-FavWorkspace([string]$path, [string]$app, [string]$kind, [string]$name) {
+  if (-not $path) { return $false }
+  if (-not $app)  { $app = 'code' }
+  if (-not $kind) { $kind = 'folder' }
+  if (-not $name) { $name = (Split-Path $path -Leaf); if (-not $name) { $name = $path } }
+  $key = '{0}|{1}' -f $app, $path.ToLowerInvariant()
+  $items = New-Object System.Collections.ArrayList
+  foreach ($it in (Get-FavItems)) {
+    if (('{0}|{1}' -f [string]$it.app, ([string]$it.path).ToLowerInvariant()) -eq $key) { return $false }
+    [void]$items.Add($it)
+  }
+  [void]$items.Add([pscustomobject]@{ app = $app; kind = $kind; path = $path; name = $name })
+  Save-FavItems $items
+  return $true
+}
+# Drop every favorite matching $path (any app). Returns $true when one was removed.
+function Remove-FavWorkspace([string]$path) {
+  if (-not $path) { return $false }
+  $p = $path.ToLowerInvariant()
+  $kept = @(); $removed = $false
+  foreach ($it in (Get-FavItems)) {
+    if (([string]$it.path).ToLowerInvariant() -eq $p) { $removed = $true; continue }
+    $kept += $it
+  }
+  if ($removed) { Save-FavItems $kept }
+  return $removed
+}
+# The editor windows open right now, via the shared helper's -OpenJson mode (run
+# as a hidden child so there's no console flash, output captured through a temp
+# file). Returns an array of { app, kind, path, name } (empty on any failure).
+function Get-OpenWindowList {
+  try {
+    if (-not (Test-Path $wsHelper)) { return @() }
+    $tmp  = [System.IO.Path]::GetTempFileName()
+    $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $wsHelper), '-OpenJson')
+    Start-Process powershell -WindowStyle Hidden -ArgumentList $argv -RedirectStandardOutput $tmp -PassThru -Wait | Out-Null
+    $raw = [System.IO.File]::ReadAllText($tmp)
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+    if (-not $raw -or -not $raw.Trim()) { return @() }
+    return @($raw | ConvertFrom-Json)
+  } catch { return @() }
+}
+
 # --- Per-project objectives (a scrollable one-line todo list) ---------------
 # Each project carries a manually-typed TODO list, shared by ALL of that project's
 # sessions. Stored as { items: { "<project>": [ { text, done }, ... ] } } in
@@ -697,6 +761,342 @@ function Edit-Tasks([string]$project) {
   return $null
 }
 
+# --- Favorite-workspace manager: shared state + operations ------------------
+# Mirrors the task editor's design (top-level WE-* helpers, not closures, so the
+# per-row handlers reach the real $script: state by CALLING them). The list is a
+# curated set of { app, kind, path, name } items persisted to workspaces.json.
+$script:weItems = $null   # working ArrayList of { app; kind; path; name }
+$script:weSel   = -1      # selected row index (-1 = none)
+$script:weRows  = @()     # row panels, parallel to $script:weItems
+
+# A stable accent for a row's left bar: blue for VS Code, violet for Cursor.
+function WE-AppColor([string]$app) {
+  if ($app -eq 'cursor') { return [System.Drawing.Color]::FromArgb(163, 113, 247) }
+  return [System.Drawing.Color]::FromArgb(59, 130, 246)
+}
+function WE-ApplySel {
+  for ($i = 0; $i -lt $script:weRows.Count; $i++) {
+    $rp = $script:weRows[$i]
+    if ($i -eq $script:weSel) { $rp.BackColor = $script:etRowSel; $rp.Tag.bar.Visible = $true }
+    else { $rp.BackColor = $script:etRowIdle; $rp.Tag.bar.Visible = $false }
+  }
+}
+function WE-Footer {
+  $n = $script:weItems.Count
+  if ($n -eq 0) { $script:weFooter.Text = 'No favorites yet' }
+  else { $script:weFooter.Text = ('{0} workspace{1}' -f $n, $(if ($n -eq 1) { '' } else { 's' })) }
+}
+function WE-Select([int]$idx) { $script:weSel = $idx; WE-ApplySel }
+# Build one row: app-coloured left bar + name (white) + dim path, both ellipsized.
+function WE-MakeRow([int]$idx) {
+  $it = $script:weItems[$idx]
+  $rp = New-Object System.Windows.Forms.Panel
+  $rp.Width = $script:weRowW; $rp.Height = 38
+  $rp.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 4)
+  $rp.BackColor = $script:etRowIdle
+  $rp.Cursor = [System.Windows.Forms.Cursors]::Hand
+
+  $bar = New-Object System.Windows.Forms.Panel
+  $bar.Dock = 'Left'; $bar.Width = 3; $bar.BackColor = (WE-AppColor ([string]$it.app)); $bar.Visible = $false
+  $rp.Controls.Add($bar)
+
+  $name = New-Object System.Windows.Forms.Label
+  $name.AutoSize = $false; $name.TextAlign = 'MiddleLeft'; $name.AutoEllipsis = $true
+  $name.Font = New-Object System.Drawing.Font('Segoe UI', 10.5, [System.Drawing.FontStyle]::Bold)
+  $name.ForeColor = $white; $name.BackColor = [System.Drawing.Color]::Transparent
+  $name.Cursor = [System.Windows.Forms.Cursors]::Hand
+  $name.Location = New-Object System.Drawing.Point(14, 3)
+  $name.Size = New-Object System.Drawing.Size(($script:weRowW - 20), 18)
+  $name.Text = [string]$it.name
+  $rp.Controls.Add($name)
+
+  $path = New-Object System.Windows.Forms.Label
+  $path.AutoSize = $false; $path.TextAlign = 'MiddleLeft'; $path.AutoEllipsis = $true
+  $path.Font = New-Object System.Drawing.Font('Segoe UI', 8.25)
+  $path.ForeColor = $grey; $path.BackColor = [System.Drawing.Color]::Transparent
+  $path.Cursor = [System.Windows.Forms.Cursors]::Hand
+  $path.Location = New-Object System.Drawing.Point(14, 19)
+  $path.Size = New-Object System.Drawing.Size(($script:weRowW - 20), 16)
+  $path.Text = [string]$it.path
+  $rp.Controls.Add($path)
+
+  $rp.Tag = @{ bar = $bar; idx = $idx }
+
+  $selectThis = { WE-Select $idx }.GetNewClosure()
+  $rp.Add_Click($selectThis); $name.Add_Click($selectThis); $path.Add_Click($selectThis)
+  $rp.Add_MouseEnter({ if ($script:weSel -ne $idx) { $this.BackColor = $script:etRowHov } }.GetNewClosure())
+  $rp.Add_MouseLeave({ if ($script:weSel -ne $idx) { $this.BackColor = $script:etRowIdle } }.GetNewClosure())
+  return $rp
+}
+function WE-Fill([int]$select) {
+  $script:weLst.SuspendLayout()
+  $script:weLst.Controls.Clear()
+  $script:weRows = @()
+  if ($script:weItems.Count -eq 0) {
+    $empty = New-Object System.Windows.Forms.Label
+    $empty.Text = 'No favorites yet ' + [char]0x2014 + ' click Add to pick from open windows'
+    $empty.AutoSize = $true; $empty.ForeColor = $grey
+    $empty.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Italic)
+    $empty.Margin = New-Object System.Windows.Forms.Padding(6, 10, 6, 6)
+    $script:weLst.Controls.Add($empty)
+    $script:weSel = -1
+  } else {
+    for ($i = 0; $i -lt $script:weItems.Count; $i++) {
+      $rp = WE-MakeRow $i
+      $script:weLst.Controls.Add($rp)
+      $script:weRows += $rp
+    }
+    if ($select -lt 0) { $select = 0 }
+    if ($select -ge $script:weItems.Count) { $select = $script:weItems.Count - 1 }
+    $script:weSel = $select
+  }
+  $script:weLst.ResumeLayout()
+  WE-ApplySel
+  WE-Footer
+}
+function WE-Delete {
+  $i = $script:weSel
+  if ($i -lt 0 -or $i -ge $script:weItems.Count) { return }
+  $script:weItems.RemoveAt($i); WE-Fill $i
+}
+function WE-Move([int]$dir) {
+  $i = $script:weSel; $j = $i + $dir
+  if ($i -lt 0 -or $j -lt 0 -or $j -ge $script:weItems.Count) { return }
+  $tmp = $script:weItems[$i]; $script:weItems.RemoveAt($i); $script:weItems.Insert($j, $tmp); WE-Fill $j
+}
+# Add via the open-windows picker, skipping any that are already in the list.
+function WE-Add {
+  $picked = Pick-OpenWorkspaces
+  if (-not $picked) { return }
+  $seen = @{}
+  foreach ($it in $script:weItems) { $seen['{0}|{1}' -f [string]$it.app, ([string]$it.path).ToLowerInvariant()] = $true }
+  $added = -1
+  foreach ($it in @($picked)) {
+    $key = '{0}|{1}' -f [string]$it.app, ([string]$it.path).ToLowerInvariant()
+    if ($seen.ContainsKey($key)) { continue }
+    $seen[$key] = $true
+    [void]$script:weItems.Add([pscustomobject]@{ app = [string]$it.app; kind = [string]$it.kind; path = [string]$it.path; name = [string]$it.name })
+    $added = $script:weItems.Count - 1
+  }
+  if ($added -ge 0) { WE-Fill $added }
+}
+
+# A dark checklist of the editor windows open right now; returns the chosen items
+# (array) or $null on cancel / nothing open. Used by the manager's Add button.
+function Pick-OpenWorkspaces {
+  $open = @(Get-OpenWindowList)
+  $script:menuOpen = $true
+  $dlg = New-Object System.Windows.Forms.Form
+  $dlg.Text            = 'Add from open windows'
+  $dlg.FormBorderStyle = 'FixedDialog'
+  $dlg.StartPosition   = 'CenterScreen'
+  $dlg.TopMost         = $true
+  $dlg.MaximizeBox     = $false
+  $dlg.MinimizeBox     = $false
+  $dlg.ShowInTaskbar   = $false
+  $dlg.BackColor       = $bg
+  $dlg.ForeColor       = $white
+  $dlg.Font            = New-Object System.Drawing.Font('Segoe UI', 9.75)
+  $dlg.ClientSize      = New-Object System.Drawing.Size(520, 360)
+  try { if (Test-Path $iconPath) { $dlg.Icon = New-Object System.Drawing.Icon($iconPath) } } catch {}
+
+  $accent = Get-CDAccent
+  $result = $null
+
+  if ($open.Count -eq 0) {
+    $msg = New-Object System.Windows.Forms.Label
+    $msg.Text = 'No VS Code / Cursor windows are open right now.'
+    $msg.AutoSize = $true; $msg.ForeColor = $grey
+    $msg.Location = New-Object System.Drawing.Point(20, 24)
+    $dlg.Controls.Add($msg)
+  } else {
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = 'Tick the windows to add as favorites:'
+    $hint.AutoSize = $true; $hint.ForeColor = $grey
+    $hint.Location = New-Object System.Drawing.Point(20, 14)
+    $dlg.Controls.Add($hint)
+
+    $clb = New-Object System.Windows.Forms.CheckedListBox
+    $clb.Location      = New-Object System.Drawing.Point(20, 40)
+    $clb.Size          = New-Object System.Drawing.Size(480, 256)
+    $clb.BackColor     = [System.Drawing.Color]::FromArgb(20, 20, 24)
+    $clb.ForeColor     = $white
+    $clb.BorderStyle   = 'FixedSingle'
+    $clb.CheckOnClick  = $true
+    $clb.IntegralHeight = $false
+    $clb.Font          = New-Object System.Drawing.Font('Segoe UI', 9.75)
+    foreach ($it in $open) {
+      $tag = if ([string]$it.app -eq 'cursor') { 'Cursor' } else { 'Code' }
+      [void]$clb.Items.Add(('[{0}]  {1}   {2}' -f $tag, [string]$it.name, [string]$it.path), $true)
+    }
+    $dlg.Controls.Add($clb)
+  }
+
+  $ok = New-Object System.Windows.Forms.Button
+  $ok.Text = 'Add'; $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+  $ok.FlatStyle = 'Flat'; $ok.FlatAppearance.BorderSize = 0
+  $ok.ForeColor = (Get-TextOn $accent); $ok.BackColor = $accent
+  $ok.Size = New-Object System.Drawing.Size(110, 32)
+  $ok.Location = New-Object System.Drawing.Point(280, 312)
+  $ok.Enabled = ($open.Count -gt 0)
+  $dlg.Controls.Add($ok)
+
+  $cl = New-Object System.Windows.Forms.Button
+  $cl.Text = 'Cancel'; $cl.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+  $cl.FlatStyle = 'Flat'; $cl.FlatAppearance.BorderSize = 0
+  $cl.ForeColor = $grey; $cl.BackColor = $rowBg
+  $cl.Size = New-Object System.Drawing.Size(110, 32)
+  $cl.Location = New-Object System.Drawing.Point(390, 312)
+  $dlg.Controls.Add($cl)
+
+  $dlg.AcceptButton = $ok
+  $dlg.CancelButton = $cl
+
+  $res = $dlg.ShowDialog()
+  if ($res -eq [System.Windows.Forms.DialogResult]::OK -and $open.Count -gt 0) {
+    $clb = $dlg.Controls | Where-Object { $_ -is [System.Windows.Forms.CheckedListBox] } | Select-Object -First 1
+    $picked = @()
+    foreach ($i in $clb.CheckedIndices) { $picked += $open[$i] }
+    if ($picked.Count -gt 0) { $result = $picked }
+  }
+  $dlg.Dispose()
+  $script:menuOpen = $false
+  $script:shownAt  = [Environment]::TickCount
+  return $result
+}
+
+# The favorite-workspace manager (opened from the gear menu). Add (from open
+# windows) / delete / reorder, then Save persists the curated list to
+# workspaces.json. Same dark dialog shell as the task editor.
+function Edit-Workspaces {
+  $items = New-Object System.Collections.ArrayList
+  foreach ($it in (Get-FavItems)) {
+    [void]$items.Add([pscustomobject]@{ app = [string]$it.app; kind = [string]$it.kind; path = [string]$it.path; name = [string]$it.name })
+  }
+
+  $script:menuOpen = $true
+  $dlg = New-Object System.Windows.Forms.Form
+  $dlg.Text            = 'Favorite workspaces'
+  $dlg.FormBorderStyle = 'FixedDialog'
+  $dlg.StartPosition   = 'CenterScreen'
+  $dlg.TopMost         = $true
+  $dlg.MaximizeBox     = $false
+  $dlg.MinimizeBox     = $false
+  $dlg.ShowInTaskbar   = $false
+  $dlg.BackColor       = $bg
+  $dlg.ForeColor       = $white
+  $dlg.Font            = New-Object System.Drawing.Font('Segoe UI', 9.75)
+  $dlg.ClientSize      = New-Object System.Drawing.Size(600, 412)
+  try { if (Test-Path $iconPath) { $dlg.Icon = New-Object System.Drawing.Icon($iconPath) } } catch {}
+
+  $accent = Get-CDAccent
+  $script:weItems    = $items
+  $script:etRowIdle  = $rowBg
+  $script:etRowHov   = [System.Drawing.Color]::FromArgb(46, 46, 54)
+  $script:etRowSel   = [System.Drawing.Color]::FromArgb(58, 58, 70)
+  $canvasBg          = [System.Drawing.Color]::FromArgb(20, 20, 24)
+
+  $title = New-Object System.Windows.Forms.Label
+  $title.Text = 'Favorite workspaces'; $title.AutoSize = $true; $title.ForeColor = $white
+  $title.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
+  $title.Location = New-Object System.Drawing.Point(20, 13)
+  $dlg.Controls.Add($title)
+  $hint = New-Object System.Windows.Forms.Label
+  $hint.Text = 'reopened from the tray ' + [char]0x00B7 + ' survives a restart'
+  $hint.AutoSize = $true; $hint.ForeColor = $grey
+  $hint.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+  $dlg.Controls.Add($hint)
+  $hint.Location = New-Object System.Drawing.Point((416 - $hint.PreferredWidth), 18)
+
+  $wrap = New-Object System.Windows.Forms.Panel
+  $wrap.Location  = New-Object System.Drawing.Point(20, 44)
+  $wrap.Size      = New-Object System.Drawing.Size(396, 328)
+  $wrap.BackColor = [System.Drawing.Color]::FromArgb(60, 60, 70)
+  $dlg.Controls.Add($wrap)
+  $lst = New-Object System.Windows.Forms.FlowLayoutPanel
+  $lst.Location      = New-Object System.Drawing.Point(1, 1)
+  $lst.Size          = New-Object System.Drawing.Size(394, 326)
+  $lst.FlowDirection = 'TopDown'
+  $lst.WrapContents  = $false
+  $lst.AutoScroll    = $true
+  $lst.BackColor     = $canvasBg
+  $lst.Padding       = New-Object System.Windows.Forms.Padding(6, 6, 6, 6)
+  $wrap.Controls.Add($lst)
+  $script:weLst  = $lst
+  $script:weRowW = $lst.ClientSize.Width - [System.Windows.Forms.SystemInformation]::VerticalScrollBarWidth - 14
+  $script:weSel  = 0
+  $script:weRows = @()
+
+  $lighten = { param($c, $d) [System.Drawing.Color]::FromArgb([math]::Min(255, $c.R + $d), [math]::Min(255, $c.G + $d), [math]::Min(255, $c.B + $d)) }
+  $styleBtn = {
+    param($b, [string]$kind)
+    $b.FlatStyle = 'Flat'
+    $b.FlatAppearance.BorderSize = 0
+    $b.Font   = New-Object System.Drawing.Font('Segoe UI', 9.75)
+    $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $b.UseVisualStyleBackColor = $false
+    $b.TextAlign = 'MiddleCenter'
+    if ($kind -eq 'accent')     { $base = $accent; $fore = Get-TextOn $accent }
+    elseif ($kind -eq 'danger') { $base = $rowBg;  $fore = [System.Drawing.Color]::FromArgb(232, 124, 112) }
+    elseif ($kind -eq 'muted')  { $base = $rowBg;  $fore = $grey }
+    else                        { $base = $rowBg;  $fore = $white }
+    $b.BackColor = $base; $b.ForeColor = $fore
+    $b.FlatAppearance.MouseOverBackColor = (& $lighten $base 18)
+    $b.FlatAppearance.MouseDownBackColor = (& $lighten $base 30)
+  }
+  $mkBtn = {
+    param([string]$text, [int]$top, [string]$kind)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text
+    $b.Size = New-Object System.Drawing.Size(150, 34)
+    $b.Location = New-Object System.Drawing.Point(432, $top)
+    & $styleBtn $b $kind
+    $dlg.Controls.Add($b)
+    return $b
+  }
+
+  $bAdd = & $mkBtn ([char]0x002B + '  Add')              44  'default'
+  $bDel = & $mkBtn 'Delete'                              82  'danger'
+  $bUp  = & $mkBtn ([char]0x2191 + '  Move up')          138 'default'
+  $bDn  = & $mkBtn ([char]0x2193 + '  Move down')        176 'default'
+
+  $bAdd.Add_Click({ WE-Add })
+  $bDel.Add_Click({ WE-Delete })
+  $bUp.Add_Click({ WE-Move -1 })
+  $bDn.Add_Click({ WE-Move 1 })
+
+  $footer = New-Object System.Windows.Forms.Label
+  $footer.AutoSize = $true; $footer.ForeColor = $grey
+  $footer.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+  $footer.Location = New-Object System.Drawing.Point(20, 388)
+  $dlg.Controls.Add($footer)
+  $script:weFooter = $footer
+
+  $ok = New-Object System.Windows.Forms.Button
+  $ok.Text = 'Save'; $ok.DialogResult = [System.Windows.Forms.DialogResult]::OK
+  $ok.Size = New-Object System.Drawing.Size(150, 34)
+  $ok.Location = New-Object System.Drawing.Point(432, 300)
+  & $styleBtn $ok 'accent'
+  $dlg.Controls.Add($ok)
+
+  $cl = New-Object System.Windows.Forms.Button
+  $cl.Text = 'Cancel'; $cl.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+  $cl.Size = New-Object System.Drawing.Size(150, 34)
+  $cl.Location = New-Object System.Drawing.Point(432, 338)
+  & $styleBtn $cl 'muted'
+  $dlg.Controls.Add($cl)
+
+  $dlg.AcceptButton = $ok
+  $dlg.CancelButton = $cl
+  WE-Fill 0
+
+  $res = $dlg.ShowDialog()
+  $dlg.Dispose()
+  $script:menuOpen = $false
+  $script:shownAt  = [Environment]::TickCount
+  if ($res -eq [System.Windows.Forms.DialogResult]::OK) { Save-FavItems $script:weItems }
+}
+
 # Material icon glyphs ($script:MAT codepoints, the private font collection, and
 # New-IconFont / Get-IconChar / Set-IconLabel / New-MatIcon / New-Badge) live in
 # session-ui-icons.ps1, dot-sourced above.
@@ -1189,18 +1589,18 @@ function Build-SettingsMenu {
 
   [void]$m.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
-  # Favorite workspaces - a fully manual pair. "Save" snapshots the VS Code /
-  # Cursor windows open right now into workspaces.json; "Reopen" relaunches them
-  # (survives a Windows restart). Closing/opening windows in between changes
-  # nothing until you click Save again. "Reopen" is a submenu: "Reopen all" plus
-  # one entry per saved workspace, so favorites can also be reopened one by one.
+  # Favorite workspaces - a curated, manually-managed list (workspaces.json).
+  # "Manage favorites" opens the add/delete/reorder editor (Add picks from the
+  # editor windows open right now); a workspace can also be added straight from a
+  # session row's right-click menu. "Reopen" relaunches them (survives a Windows
+  # restart) - a submenu: "Reopen all" plus one entry per saved workspace.
   $wsItems = Get-FavItems
   $wsN = @($wsItems).Count
 
-  $wsSave = New-Object System.Windows.Forms.ToolStripMenuItem('Save open workspaces as favorites')
-  $wsSave.ToolTipText = "Remember the VS Code / Cursor windows open right now (overwrites the previous set)"
-  $wsSave.Add_Click({ Invoke-Workspaces '-Save' })
-  [void]$m.Items.Add($wsSave)
+  $wsMng = New-Object System.Windows.Forms.ToolStripMenuItem('Manage favorite workspaces' + [char]0x2026)
+  $wsMng.ToolTipText = "Add (from open editor windows) or remove the workspaces saved as favorites"
+  $wsMng.Add_Click({ Edit-Workspaces })
+  [void]$m.Items.Add($wsMng)
 
   $wsReTxt = if ($wsN -gt 0) { "Reopen favorite workspaces ($wsN)" } else { 'Reopen favorite workspaces' }
   $wsRe = New-Object System.Windows.Forms.ToolStripMenuItem($wsReTxt)
@@ -1969,10 +2369,11 @@ function Make-Row($s, $status, $seen, $promptText, $age, $indent) {
   $sid  = [string]$s.session_id
   $clickHandler = {
     Set-Seen $sid                                          # mark this completion as opened
+    # First try to raise an already-open editor window for this project; if none is
+    # open (the workspace is closed, possibly with no editor running at all), open
+    # the workspace folder in VS Code / Cursor.
     if (-not [WinFocus]::FocusByTitle($proj)) {
-      # Fallback: focus/open the REAL VS Code (never Cursor).
-      $codeExe = (Get-Process -Name Code -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1).Path
-      if ($codeExe -and $cwd) { Start-Process $codeExe -ArgumentList ('"{0}"' -f $cwd) -ErrorAction SilentlyContinue }
+      Open-Workspace $cwd | Out-Null
     }
   }.GetNewClosure()
   $btn.Add_Click($clickHandler)
@@ -1988,20 +2389,31 @@ function Make-Row($s, $status, $seen, $promptText, $age, $indent) {
   # whole menu is suppressed when nothing applies. The three deep links are reused
   # slots (text/url set on open) so one menu serves GitHub, GitLab or Bitbucket.
   $cmRow      = New-Object System.Windows.Forms.ContextMenuStrip
+  $editorItem = New-Object System.Windows.Forms.ToolStripMenuItem('Open in editor')
   $folderItem = New-Object System.Windows.Forms.ToolStripMenuItem('Open folder')
   $termItem   = New-Object System.Windows.Forms.ToolStripMenuItem('Open in terminal')
+  $favSep     = New-Object System.Windows.Forms.ToolStripSeparator
+  $favItem    = New-Object System.Windows.Forms.ToolStripMenuItem('Add to favorite workspaces')
   $sep1       = New-Object System.Windows.Forms.ToolStripSeparator
   $openItem   = New-Object System.Windows.Forms.ToolStripMenuItem('Open repository in browser')
   $sub1 = New-Object System.Windows.Forms.ToolStripMenuItem('')
   $sub2 = New-Object System.Windows.Forms.ToolStripMenuItem('')
   $sub3 = New-Object System.Windows.Forms.ToolStripMenuItem('')
   $subItems = @($sub1, $sub2, $sub3)
-  foreach ($it in @($folderItem, $termItem, $sep1, $openItem, $sub1, $sub2, $sub3)) { [void]$cmRow.Items.Add($it) }
+  foreach ($it in @($editorItem, $folderItem, $termItem, $favSep, $favItem, $sep1, $openItem, $sub1, $sub2, $sub3)) { [void]$cmRow.Items.Add($it) }
   $cmRow.Add_Opening({
     param($snd, $e)
     $hasFolder = ($cwd -and (Test-Path -LiteralPath $cwd))
+    $editorItem.Visible = $hasFolder
     $folderItem.Visible = $hasFolder
     $termItem.Visible   = $hasFolder
+    # Favorite toggle: add this folder, or remove it if it's already saved.
+    $favSep.Visible  = $hasFolder
+    $favItem.Visible = $hasFolder
+    if ($hasFolder) {
+      $favItem.Checked = (Test-IsFav $cwd)
+      $favItem.Text    = if ($favItem.Checked) { 'Remove from favorite workspaces' } else { 'Add to favorite workspaces' }
+    }
     $u = Get-RepoWebUrl $cwd
     if ($u) { $openItem.Visible = $true; $openItem.Text = Get-RepoMenuLabel $u; $openItem.Tag = $u }
     else    { $openItem.Visible = $false }
@@ -2013,8 +2425,16 @@ function Make-Row($s, $status, $seen, $promptText, $age, $indent) {
     $sep1.Visible = ($hasFolder -and $u)
     if (-not $hasFolder -and -not $u) { $e.Cancel = $true }
   }.GetNewClosure())
+  $editorItem.Add_Click({ if (-not [WinFocus]::FocusByTitle($proj)) { Open-Workspace $cwd | Out-Null } }.GetNewClosure())
   $folderItem.Add_Click({ if ($cwd) { Start-Process explorer.exe -ArgumentList ('"{0}"' -f $cwd) -ErrorAction SilentlyContinue } }.GetNewClosure())
   $termItem.Add_Click({ Open-Terminal $cwd }.GetNewClosure())
+  # Add this project folder to the favorites, or remove it if already there. App
+  # defaults to VS Code ('code'); the manager's picker stamps the real app.
+  $favItem.Add_Click({
+    if (-not $cwd) { return }
+    if (Test-IsFav $cwd) { Remove-FavWorkspace $cwd | Out-Null }
+    else { Add-FavWorkspace $cwd 'code' 'folder' $proj | Out-Null }
+  }.GetNewClosure())
   $openItem.Add_Click({ if ($openItem.Tag) { Start-Process ([string]$openItem.Tag) -ErrorAction SilentlyContinue } }.GetNewClosure())
   foreach ($si in @($sub1, $sub2, $sub3)) { $si.Add_Click({ if ($this.Tag) { Start-Process ([string]$this.Tag) -ErrorAction SilentlyContinue } }) }
   $btn.ContextMenuStrip      = $cmRow

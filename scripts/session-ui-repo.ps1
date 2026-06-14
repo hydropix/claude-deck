@@ -98,3 +98,43 @@ function Open-Terminal([string]$cwd) {
   try { Start-Process wt.exe -ArgumentList ('-d "{0}"' -f $cwd) -ErrorAction Stop }
   catch { Start-Process powershell.exe -WorkingDirectory $cwd -ErrorAction SilentlyContinue }
 }
+
+# Resolve the VS Code / Cursor executable so we can open a workspace even when NO
+# editor is currently running (the row click's "focus an open window" path having
+# missed). Preference order: a running editor (so we reuse whatever the user has
+# open), then the `code` / `cursor` CLI shim on PATH (bin\code.cmd sits next to
+# ..\Code.exe), then the known per-user / machine-wide install locations. $null if
+# nothing is found.
+function Resolve-IdeExe {
+  foreach ($name in 'Code', 'Cursor') {
+    $p = Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1
+    if ($p) { return $p.Path }
+  }
+  foreach ($cli in @(@{ cmd = 'code'; exe = 'Code.exe' }, @{ cmd = 'cursor'; exe = 'Cursor.exe' })) {
+    $cmd = Get-Command $cli.cmd -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd -and $cmd.Source) {
+      $exe = Join-Path (Split-Path (Split-Path $cmd.Source -Parent) -Parent) $cli.exe
+      if (Test-Path -LiteralPath $exe) { return $exe }
+    }
+  }
+  $cands = @(
+    (Join-Path $env:LOCALAPPDATA 'Programs\Microsoft VS Code\Code.exe'),
+    (Join-Path $env:ProgramFiles  'Microsoft VS Code\Code.exe'),
+    (Join-Path ${env:ProgramFiles(x86)} 'Microsoft VS Code\Code.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\cursor\Cursor.exe')
+  )
+  foreach ($c in $cands) { if ($c -and (Test-Path -LiteralPath $c)) { return $c } }
+  return $null
+}
+
+# Open a session's workspace folder in VS Code / Cursor. Used as the row click's
+# fallback when no editor window matched the project: launches a new window (or
+# reuses an existing one for that folder if the editor is already running). Returns
+# $true when an editor was launched.
+function Open-Workspace([string]$cwd) {
+  if (-not $cwd -or -not (Test-Path -LiteralPath $cwd)) { return $false }
+  $exe = Resolve-IdeExe
+  if (-not $exe) { return $false }
+  try { Start-Process $exe -ArgumentList ('"{0}"' -f $cwd) -ErrorAction Stop; return $true }
+  catch { return $false }
+}
